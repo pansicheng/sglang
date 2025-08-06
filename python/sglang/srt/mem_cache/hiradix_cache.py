@@ -71,6 +71,8 @@ class HiRadixCache(RadixCache):
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
+        group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+        self.prefetch_tp_group = torch.distributed.new_group(group_ranks, backend="gloo")
         # todo: customizable storage prefetch threshold
         self.prefetch_threshold = 256
 
@@ -565,7 +567,18 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
+
+        can_prefetch = host_indices is not None
+        if self.tp_world_size > 1:
+            can_prefetch = torch.tensor(can_prefetch, dtype=torch.int)
+            torch.distributed.all_reduce(
+                can_prefetch,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.prefetch_tp_group,
+            )
+            can_prefetch = bool(can_prefetch.item())
+
+        if not can_prefetch:
             last_host_node.release_host()
             # no sufficient host memory to prefetch
             return
