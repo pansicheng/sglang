@@ -1,89 +1,111 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import logging
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.cpp_extension import load
 
-root = Path(__file__).parent.resolve()
-start_time = time.time()
+logger = logging.getLogger(__name__)
+
+# Load CUDA extension
+_root = Path(__file__).parent.resolve()
+_start_time = time.time()
 elastic_utils = load(
     name="elastic_utils",
-    sources=[f"{root}/elastic_utils.cu"],
+    sources=[f"{_root}/elastic_utils.cu"],
     extra_ldflags=["-lcuda"],
     verbose=True,
 )
-load_time = time.time() - start_time
-print(f"Time taken to load elastic_utils: {load_time:.4f} seconds")
+logger.info(
+    f"Time taken to load elastic_utils: {time.time() - _start_time:.4f} seconds"
+)
 
-PHYSICAL_PAGE_SIZE = None
+# Cached physical page size
+_physical_page_size: Optional[int] = None
+
+# TMS integration state
+_memory_saver = None
+_pause_callbacks = set()
+_resume_callbacks = set()
+_orig_pause = None
+_orig_resume = None
 
 
 def _get_physical_page_size() -> int:
-    global PHYSICAL_PAGE_SIZE
-    if PHYSICAL_PAGE_SIZE is not None:
-        return PHYSICAL_PAGE_SIZE
-    PHYSICAL_PAGE_SIZE = elastic_utils.get_physical_page_size()
-    return PHYSICAL_PAGE_SIZE
+    global _physical_page_size
+    if _physical_page_size is not None:
+        return _physical_page_size
+    _physical_page_size = elastic_utils.get_physical_page_size()
+    return _physical_page_size
 
 
 def initialize_tms_integration(memory_saver):
-    global g_memory_saver, g_orig_pause, g_orig_resume, g_pause_cbs, g_resume_cbs
+    """Initialize torch_memory_saver integration with pause/resume callbacks."""
+    global _memory_saver, _orig_pause, _orig_resume, _pause_callbacks, _resume_callbacks
 
-    if g_memory_saver is not None:
+    if _memory_saver is not None:
         return
 
-    g_memory_saver = memory_saver
-    g_orig_pause = memory_saver.pause
-    g_orig_resume = memory_saver.resume
+    _memory_saver = memory_saver
+    _orig_pause = memory_saver.pause
+    _orig_resume = memory_saver.resume
 
-    def run_pause_callbacks():
-        for cb in g_pause_cbs:
+    def _run_pause_callbacks():
+        for cb in _pause_callbacks:
             cb()
 
-    def run_resume_callbacks():
-        for cb in g_resume_cbs:
+    def _run_resume_callbacks():
+        for cb in _resume_callbacks:
             cb()
 
-    def pause_hook(*args, **kwargs):
-        run_pause_callbacks()
-        return g_orig_pause(*args, **kwargs)
+    def _pause_hook(*args, **kwargs):
+        _run_pause_callbacks()
+        return _orig_pause(*args, **kwargs)
 
-    def resume_hook(*args, **kwargs):
-        run_resume_callbacks()
-        return g_orig_resume(*args, **kwargs)
+    def _resume_hook(*args, **kwargs):
+        _run_resume_callbacks()
+        return _orig_resume(*args, **kwargs)
 
-    g_memory_saver.pause = pause_hook
-    g_memory_saver.resume = resume_hook
-
-
-g_memory_saver = None
-g_pause_cbs = set()
-g_resume_cbs = set()
-g_orig_pause = None
-g_orig_resume = None
+    _memory_saver.pause = _pause_hook
+    _memory_saver.resume = _resume_hook
 
 
-def register_tms_pause_callback(cb):
-    global g_memory_saver, g_pause_cbs
-    if g_memory_saver is None:
-        return
-    g_pause_cbs.add(cb)
+def register_tms_pause_callback(callback):
+    """Register a callback to be called before memory saver pauses."""
+    if _memory_saver is not None:
+        _pause_callbacks.add(callback)
 
 
-def register_tms_resume_callback(cb):
-    global g_memory_saver, g_resume_cbs
-    if g_memory_saver is None:
-        return
-    g_resume_cbs.add(cb)
+def register_tms_resume_callback(callback):
+    """Register a callback to be called before memory saver resumes."""
+    if _memory_saver is not None:
+        _resume_callbacks.add(callback)
 
 
 class ElasticTensor:
+    """Tensor with elastic memory mapping supporting dynamic expand/shrink."""
 
     def __init__(
         self,
         num: int,
         max_num: int,
-        state_shape: tuple[int],
+        state_shape: tuple[int, ...],
         dtype: torch.dtype,
         device: torch.device,
     ):
@@ -92,66 +114,65 @@ class ElasticTensor:
         self.device = device
 
         elastic_utils.initialize_elastic_utils(self.device.index)
-        self.physical_page_size = _get_physical_page_size()
+        self._page_size = _get_physical_page_size()
 
         self._num = num
         self._max_num = max_num
 
-        # Calculate initial physical size
-        self._current_psize = self._round_up_to_page_size(
-            self._num * self._state_elements * self.dtype.itemsize
-        )
+        # Calculate state elements and memory size
+        self._state_elements = 1
+        for dim in self.state_shape:
+            self._state_elements *= dim
+        self._state_memsize = self._state_elements * self.dtype.itemsize
 
-        # Calculate max virtual size
-        max_vsize = self._round_up_to_page_size(
-            self._max_num * self._state_elements * self.dtype.itemsize
-        )
+        # Calculate initial and max physical sizes
+        self._current_psize = self._round_up_to_page_size(num * self._state_memsize)
+        max_vsize = self._round_up_to_page_size(max_num * self._state_memsize)
 
         # Create elastic tensor
         self._full_tensor = elastic_utils.create_etensor(
             max_vsize, self._current_psize, self.dtype
         )
-        self.tensor = self._full_tensor[: self._max_num * self._state_elements].view(
-            (self._max_num,) + self.state_shape
+        self.tensor = self._full_tensor[: max_num * self._state_elements].view(
+            (max_num,) + self.state_shape
         )
 
-        self.pause_num = -1
+        # For TMS integration: saves num before pause, used to restore on resume
+        # -1 means not in pause state
+        self.tms_saved_num = -1
 
     def __del__(self):
-        elastic_utils.cleanup_etensor(self._full_tensor)
+        try:
+            elastic_utils.cleanup_etensor(self._full_tensor)
+        except Exception:
+            pass
 
     @property
-    def _state_elements(self):
-        elements = 1
-        for dim in self.state_shape:
-            elements *= dim
-        return elements
-
-    def _round_up_to_page_size(self, size: int) -> int:
-        if size % self.physical_page_size != 0:
-            return ((size // self.physical_page_size) + 1) * self.physical_page_size
-        return size
+    def state_memsize(self) -> int:
+        return self._state_memsize
 
     @property
-    def shape(self):
+    def shape(self) -> tuple[int, ...]:
         return (self._num,) + self.state_shape
 
     @property
-    def num(self):
+    def num(self) -> int:
         return self._num
 
-    def expand(self, new_num: int):
+    @property
+    def psize(self) -> int:
+        return self._current_psize
+
+    def _round_up_to_page_size(self, size: int) -> int:
+        remainder = size % self._page_size
+        return size + (self._page_size - remainder) if remainder else size
+
+    def expand(self, new_num: int) -> int:
+        """Expand tensor to new_num elements, returning pages mapped."""
         if new_num <= self._num:
-            raise ValueError(
-                f"New num ({new_num}) must be greater than current num ({self._num})"
-            )
+            raise ValueError(f"new_num ({new_num}) must be > current num ({self._num})")
 
-        # Calculate new physical size
-        new_psize = self._round_up_to_page_size(
-            new_num * self._state_elements * self.dtype.itemsize
-        )
-
-        # Map additional pages if needed
+        new_psize = self._round_up_to_page_size(new_num * self._state_memsize)
         additional_size = new_psize - self._current_psize
         pages_mapped = 0
 
@@ -159,52 +180,44 @@ class ElasticTensor:
             elastic_utils.map_physical_page(
                 self._full_tensor, self._current_psize, additional_size
             )
-            pages_mapped = additional_size // self.physical_page_size
+            pages_mapped = additional_size // self._page_size
 
         self._num = new_num
         self._current_psize = new_psize
-
         return pages_mapped
 
-    def shrink(self, new_num: int):
+    def shrink(self, new_num: int) -> int:
+        """Shrink tensor to new_num elements, returning pages unmapped."""
         if new_num >= self._num:
-            raise ValueError(
-                f"New num ({new_num}) must be less than current num ({self._num})"
-            )
+            raise ValueError(f"new_num ({new_num}) must be < current num ({self._num})")
 
-        # Calculate new physical size
-        new_psize = self._round_up_to_page_size(
-            new_num * self._state_elements * self.dtype.itemsize
-        )
-
-        # Unmap pages if needed
+        new_psize = self._round_up_to_page_size(new_num * self._state_memsize)
         unmap_size = self._current_psize - new_psize
         pages_unmapped = 0
 
         if unmap_size > 0:
             elastic_utils.unmap_physical_page(self._full_tensor, new_psize, unmap_size)
-            pages_unmapped = unmap_size // self.physical_page_size
+            pages_unmapped = unmap_size // self._page_size
 
         self._num = new_num
         self._current_psize = new_psize
-
         return pages_unmapped
 
 
-def create_test_tensor(num, state_shape, dtype, device=None):
-    """Helper function to create a test tensor with common initialization logic"""
+def create_test_tensor(
+    num: int,
+    state_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: Optional[torch.device] = None,
+) -> ElasticTensor:
+    """Create ElasticTensor for testing with max_num derived from GPU memory."""
     if device is None:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    # Calculate max_num from GPU memory
-    total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
-    element_size = dtype.itemsize
+    total_memory = torch.cuda.get_device_properties(device).total_memory
     state_elements = 1
     for dim in state_shape:
         state_elements *= dim
-    max_num = total_gpu_memory // element_size // state_elements
+    max_num = total_memory // dtype.itemsize // state_elements
 
-    etensor = ElasticTensor(
-        num=num, max_num=max_num, state_shape=state_shape, dtype=dtype, device=device
-    )
-    return etensor
+    return ElasticTensor(num, max_num, state_shape, dtype, device)

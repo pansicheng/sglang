@@ -1,4 +1,5 @@
 import logging
+import weakref
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -68,21 +69,8 @@ class SWAKVPool(KVCache):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.swa_kv_pool = token_to_kv_pool_class(
-            size=size_swa,
-            dtype=dtype,
-            layer_num=self.swa_layer_nums,
-            **kwargs,
-        )
-        kwargs.pop("swa_head_num", None)
-        kwargs.pop("swa_head_dim", None)
-        kwargs.pop("swa_v_head_dim", None)
-        self.full_kv_pool = token_to_kv_pool_class(
-            size=size,
-            dtype=dtype,
-            layer_num=self.full_layer_nums,
-            **kwargs,
-        )
+        self._create_buffers(token_to_kv_pool_class, **kwargs)
+
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -95,6 +83,23 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
+        )
+
+    def _create_buffers(self, token_to_kv_pool_class, **kwargs):
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=self.size_swa,
+            dtype=self.dtype,
+            layer_num=self.swa_layer_nums,
+            **kwargs,
+        )
+        kwargs.pop("swa_head_num", None)
+        kwargs.pop("swa_head_dim", None)
+        kwargs.pop("swa_v_head_dim", None)
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=self.size,
+            dtype=self.dtype,
+            layer_num=self.full_layer_nums,
+            **kwargs,
         )
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
@@ -248,20 +253,33 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
 
-        if page_size == 1:
+        self.need_sort = need_sort
+        self.free_pages = None
+        self.release_pages = None
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+        self._kvcache = kvcache
+        self._create_allocator()
+        self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
+
+        self.clear()
+
+    def _create_allocator(self):
+        if self.page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(
-                size,
-                dtype,
-                device,
-                kvcache.full_kv_pool,
-                need_sort,
+                self._size_full,
+                self.dtype,
+                self.device,
+                self._kvcache.full_kv_pool,
+                self.need_sort,
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
-                size_swa,
-                dtype,
-                device,
-                kvcache.swa_kv_pool,
-                need_sort,
+                self._size_swa,
+                self.dtype,
+                self.device,
+                self._kvcache.swa_kv_pool,
+                self.need_sort,
             )
         else:
             if _is_npu:
@@ -269,20 +287,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
             self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
-                size,
-                page_size,
-                dtype,
-                device,
-                kvcache.full_kv_pool,
-                need_sort,
+                self._size_full,
+                self.page_size,
+                self.dtype,
+                self.device,
+                self._kvcache.full_kv_pool,
+                self.need_sort,
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
-                size_swa,
-                page_size,
-                dtype,
-                device,
-                kvcache.swa_kv_pool,
-                need_sort,
+                self._size_swa,
+                self.page_size,
+                self.dtype,
+                self.device,
+                self._kvcache.swa_kv_pool,
+                self.need_sort,
             )
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
@@ -290,22 +308,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    size + self.page_size,
+                    self._size_full + self.page_size,
                     dtype=torch.int64,
-                    device=device,
+                    device=self.device,
                 ),
-                torch.tensor([-1], dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=self.device),
             ]
         )
 
-        self.need_sort = need_sort
-        self.free_pages = None
-        self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-
-        self.clear()
-        self._kvcache = kvcache
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):

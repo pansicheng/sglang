@@ -801,6 +801,7 @@ class MHATokenToKVPool(KVCache):
         )
 
         self._create_buffers()
+        self._create_data_ptrs()
 
         self.device_module = torch.get_device_module(self.device)
 
@@ -895,6 +896,7 @@ class MHATokenToKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+    def _create_data_ptrs(self):
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,

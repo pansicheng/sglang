@@ -186,6 +186,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import USE_ELASTICMEM
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -775,6 +776,16 @@ class Scheduler(
                 self.tp_worker.get_tokens_per_layer_info()
             )
 
+        if USE_ELASTICMEM:
+            emem_orch = getattr(self.tp_worker.model_runner, "emem_orch", None)
+            if emem_orch is None:
+                raise RuntimeError(
+                    "SGLANG_ELASTIC_MEM_POOL is enabled but ElasticMempoolOrchestrator "
+                    "was not initialized. Elastic memory is only supported for "
+                    "CUDA hybrid-SWA models."
+                )
+            self.emem_orch = emem_orch
+
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
@@ -914,6 +925,9 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+        if USE_ELASTICMEM:
+            self.emem_orch.register_scheduler(self)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -2407,6 +2421,9 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
+
+        if USE_ELASTICMEM and ret:
+            self.emem_orch.try_resize()
 
         return ret
 

@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import USE_ELASTICMEM
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
@@ -478,7 +479,14 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
-                self.token_to_kv_pool = SWAKVPool(
+                _swa_kv_pool_class = SWAKVPool
+                if USE_ELASTICMEM:
+                    from sglang.srt.mem_cache.elastic.elastic_memory_pool import (
+                        ElasticSWAKVPool,
+                    )
+
+                    _swa_kv_pool_class = ElasticSWAKVPool
+                self.token_to_kv_pool = _swa_kv_pool_class(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
@@ -610,14 +618,34 @@ class ModelRunnerKVCacheMixin:
                     )
             else:
                 if self.is_hybrid_swa:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        self.full_max_total_num_tokens,
-                        self.swa_max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
+                    _swa_token_to_kvpool_allocator_class = SWATokenToKVPoolAllocator
+                    _elastic_kwargs = {}
+                    if USE_ELASTICMEM:
+                        from sglang.srt.mem_cache.elastic.elastic_allocator import (
+                            ElasticSWATokenToKVPoolAllocator,
+                        )
+                        from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
+                            ElasticMempoolOrchestrator,
+                        )
+
+                        self.emem_orch = ElasticMempoolOrchestrator()
+                        _swa_token_to_kvpool_allocator_class = (
+                            ElasticSWATokenToKVPoolAllocator
+                        )
+                        _elastic_kwargs = {
+                            "emem_orch": self.emem_orch,
+                        }
+                    self.token_to_kv_pool_allocator = (
+                        _swa_token_to_kvpool_allocator_class(
+                            self.full_max_total_num_tokens,
+                            self.swa_max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                            **_elastic_kwargs,
+                        )
                     )
                 else:
                     if self.enable_hisparse:
@@ -658,9 +686,8 @@ class ModelRunnerKVCacheMixin:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                assert (
-                    self.token_to_kv_pool_allocator.__class__
-                    == SWATokenToKVPoolAllocator
+                assert isinstance(
+                    self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
                 )
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping

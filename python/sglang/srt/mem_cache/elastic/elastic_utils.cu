@@ -76,13 +76,19 @@ static void initialize_elastic_utils(int device_id) {
       &k_granularity_size, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
   CHECK_CU_RESULT(cuMemCreate(&k_zero_page, k_granularity_size, &prop, 0));
 
-  const char *page_size_mb_str = std::getenv("PHYSICAL_PAGE_SIZE_MB");
+  const char *page_size_mb_str = std::getenv("SGLANG_CU_PAGE_SIZE");
   k_physical_page_size = k_granularity_size;
   if (page_size_mb_str != nullptr) {
-    int page_size_mb = std::stoi(page_size_mb_str);
-    size_t page_size = static_cast<size_t>(page_size_mb) << 20;
-    TORCH_CHECK(page_size % k_granularity_size == 0);
-    k_physical_page_size = page_size;
+    try {
+      int page_size_mb = std::stoi(page_size_mb_str);
+      size_t page_size = static_cast<size_t>(page_size_mb) << 20;
+      TORCH_CHECK(page_size % k_granularity_size == 0,
+                  "Page size must be multiple of granularity size");
+      k_physical_page_size = page_size;
+    } catch (const std::exception &e) {
+      std::cerr << "Warning: Invalid SGLANG_CU_PAGE_SIZE value, using default: "
+                << e.what() << std::endl;
+    }
   }
 
   g_initialized = true;
