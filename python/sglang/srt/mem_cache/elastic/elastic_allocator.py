@@ -144,6 +144,8 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         if not (free_index > self.candidate_size).any():
             return
 
+        prev_count = len(self.candidate_unmap_pages)
+
         if self.need_sort:
             unmap_candidate_mask = self.release_pages > self.candidate_size
             self.candidate_unmap_pages = torch.cat(
@@ -156,6 +158,13 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
                 (self.candidate_unmap_pages, self.free_pages[unmap_candidate_mask])
             )
             self.free_pages = self.free_pages[~unmap_candidate_mask]
+
+        cur_count = len(self.candidate_unmap_pages)
+        target = self.size - self.candidate_size
+        if cur_count != prev_count:
+            logger.debug(
+                f"post_free: candidate_unmap_pages {prev_count}->{cur_count}/{target}"
+            )
 
     @override
     def free(self, free_index: torch.Tensor):
@@ -174,6 +183,9 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         return True
 
     def _evict_tail(self):
+        if self.candidate_size == self.size:
+            return
+
         start_time = time.perf_counter()
         evict_indices = self.unused_pages.nonzero(as_tuple=True)[0]
         evict_indices = evict_indices[evict_indices > self.candidate_size]
@@ -185,8 +197,15 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
             evict_indices = evict_indices[
                 ~torch.isin(evict_indices, self.candidate_unmap_pages)
             ]
-        logger.debug(
-            f"emem evict_tail prepare took {(time.perf_counter() - start_time) * 1000} ms"
+
+        if len(evict_indices) == 0:
+            return
+
+        logger.info(
+            f"_evict_tail: to_evict={len(evict_indices)}, "
+            f"evictable={self.evictable_size()}, "
+            f"candidate_unmap_pages={len(self.candidate_unmap_pages)}, "
+            f"{self.candidate_size=}, {self.size=}"
         )
 
         while (self.evictable_size() >= len(evict_indices)) and (
@@ -198,7 +217,9 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
             ]
 
         logger.info(
-            f"emem evict_tail took {(time.perf_counter() - start_time) * 1000} ms"
+            f"_evict_tail done: took {(time.perf_counter() - start_time) * 1000:.1f} ms, "
+            f"candidate_unmap_pages={len(self.candidate_unmap_pages)}, "
+            f"expected={self.size - self.candidate_size}"
         )
 
     @override
@@ -222,7 +243,7 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
                 )
             assert len(self.candidate_unmap_pages) == 0
             logger.info(
-                f"mark_unmap_candidate: {self._kvcache.pool_name=}, {is_candidate=}, {self.size=}, {self.candidate_size=}"
+                f"mark_unmap_candidate: {is_candidate=}, {self.size=}, {self.candidate_size=}"
             )
             return None
 
@@ -235,7 +256,7 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
         if self.size - new_size < 2 * self.cu_page_token_num:
             logger.info(
-                f"mark_unmap_candidate: {self._kvcache.pool_name=}, {is_candidate=}, {self.size=}, {self.candidate_size=}"
+                f"mark_unmap_candidate: {is_candidate=}, {self.size=}, {self.candidate_size=}"
             )
             return None
 
@@ -253,7 +274,9 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         self.free_pages = self.free_pages[~unmap_candidate_mask]
 
         logger.info(
-            f"mark_unmap_candidate: {self._kvcache.pool_name=}, {self.size=}, {self.candidate_size=}"
+            f"mark_unmap_candidate: set candidate, {self.size=}, {self.candidate_size=}, "
+            f"candidate_unmap_pages={len(self.candidate_unmap_pages)}, "
+            f"target_unmap={self.size - self.candidate_size}"
         )
         return self
 
@@ -263,8 +286,60 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
     @override
     def can_do_unmap(self) -> bool:
+        # Proactively evict cached entries from the tail region
+        # to accelerate page collection (instead of waiting until reduce()).
+        self._evict_tail()
+
         tail_consecutive_start = get_tail_consecutive_start(self.unused_pages)
-        return tail_consecutive_start <= self.candidate_size + 1
+
+        # Allow partial shrink: if the full candidate_size isn't reachable yet,
+        # check if the consecutive free tail is large enough to be worth shrinking
+        # (at least 2 * cu_page_token_num).
+        if tail_consecutive_start <= self.candidate_size + 1:
+            return True
+
+        # Partial shrink: ceiling-align to cu_page boundary so we never
+        # unmap pages below tail_consecutive_start (which may be in use).
+        partial_size = (
+            (tail_consecutive_start - 1 + self.cu_page_token_num - 1)
+            // self.cu_page_token_num
+        ) * self.cu_page_token_num
+        freeable = self.size - partial_size
+        if freeable >= 2 * self.cu_page_token_num and partial_size < self.size:
+            # Adjust candidate_size upward to what's actually achievable now
+            old_candidate = self.candidate_size
+            self.candidate_size = partial_size
+            # Return pages between old candidate and new candidate to free pool
+            if old_candidate < partial_size:
+                reclaim_mask = (self.candidate_unmap_pages <= partial_size) & (
+                    self.candidate_unmap_pages > old_candidate
+                )
+                if reclaim_mask.any():
+                    if self.need_sort:
+                        self.release_pages = torch.cat(
+                            (
+                                self.release_pages,
+                                self.candidate_unmap_pages[reclaim_mask],
+                            )
+                        )
+                    else:
+                        self.free_pages = torch.cat(
+                            (self.free_pages, self.candidate_unmap_pages[reclaim_mask])
+                        )
+                    self.candidate_unmap_pages = self.candidate_unmap_pages[
+                        ~reclaim_mask
+                    ]
+            logger.info(
+                f"can_do_unmap: partial shrink, adjusted candidate_size "
+                f"{old_candidate}->{partial_size}, freeable={freeable}"
+            )
+            return True
+
+        logger.debug(
+            f"can_do_unmap=False: {tail_consecutive_start=}, {self.candidate_size=}, "
+            f"{self.size=}, gap={tail_consecutive_start - self.candidate_size - 1}"
+        )
+        return False
 
     @override
     def can_map(self) -> bool:
@@ -276,9 +351,15 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
         self._evict_tail()
 
-        assert (
-            len(self.candidate_unmap_pages) == self.size - self.candidate_size
-        ), f"{(len(self.candidate_unmap_pages), min(self.candidate_unmap_pages), max(self.candidate_unmap_pages), self.size, self.candidate_size)=}"
+        # With partial shrink, candidate_unmap_pages may not cover the full
+        # original target.  Recalculate the expected count.
+        expected = self.size - self.candidate_size
+        actual = len(self.candidate_unmap_pages)
+        if actual != expected:
+            logger.info(
+                f"reduce: adjusting for partial shrink, "
+                f"candidate_unmap_pages={actual}, expected={expected}"
+            )
 
         new_size = self.candidate_size
         self.candidate_unmap_pages = torch.empty(
@@ -289,7 +370,7 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         logger.debug(f"{(self.size, self.candidate_size, unmap_num, cur_size)=}")
         self.size = cur_size
 
-        logger.info(f"reduce took {(time.perf_counter() - start_time) * 1000} ms")
+        logger.info(f"reduce took {(time.perf_counter() - start_time) * 1000:.1f} ms")
         return unmap_num
 
     @override

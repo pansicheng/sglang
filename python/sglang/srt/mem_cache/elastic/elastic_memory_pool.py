@@ -53,11 +53,14 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         free_memory, _ = torch.cuda.mem_get_info()
         free_memory_per_layer = free_memory // (2 * self.layer_num)
 
-        state_shape = (self.head_num, self.head_dim)
-        state_elements = self.head_num * self.head_dim
+        k_state_shape = (self.head_num, self.head_dim)
+        v_state_shape = (self.head_num, self.v_head_dim)
+        k_state_elements = self.head_num * self.head_dim
+        v_state_elements = self.head_num * self.v_head_dim
+        max_state_elements = max(k_state_elements, v_state_elements)
         dtype = self.store_dtype
 
-        max_num = free_memory_per_layer // (dtype.itemsize * state_elements)
+        max_num = free_memory_per_layer // (dtype.itemsize * max_state_elements)
         max_num = (max_num + self.page_size - 1) // self.page_size * self.page_size
 
         # cur_num includes page_size offset for allocator metadata
@@ -69,19 +72,22 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
 
         device = torch.device(torch.cuda.current_device())
         self.ek_buffer = [
-            ElasticTensor(self.cur_num, max_num, state_shape, dtype, device)
+            ElasticTensor(self.cur_num, max_num, k_state_shape, dtype, device)
             for _ in range(self.layer_num)
         ]
         self.ev_buffer = [
-            ElasticTensor(self.cur_num, max_num, state_shape, dtype, device)
+            ElasticTensor(self.cur_num, max_num, v_state_shape, dtype, device)
             for _ in range(self.layer_num)
         ]
         self.k_buffer = [et.tensor for et in self.ek_buffer]
         self.v_buffer = [et.tensor for et in self.ev_buffer]
-        self.state_memsize = self.ek_buffer[0].state_memsize
+        # Conservative: use larger of K/V for cu_page_to_token estimation
+        self.state_memsize = max(
+            self.ek_buffer[0].state_memsize, self.ev_buffer[0].state_memsize
+        )
 
         memory_used = torch.cuda.mem_get_info()[0] - free_memory
-        logger.debug(
+        logger.info(
             f"create_elastic_buffers: cur_num={self.cur_num}, memory_used={memory_used}"
         )
 
@@ -125,7 +131,7 @@ class ElasticSWAKVPool(SWAKVPool, ElasticMempool):
     def __init__(self, *args, **kwargs):
         assert USE_ELASTICMEM, "ElasticSWAKVPool requires SGLANG_ELASTIC_MEM_POOL=true"
         super().__init__(*args, **kwargs)
-        logger.info("ElasticSWAKVPool initialized")
+        logger.info(f"ElasticSWAKVPool initialized. {self.size=}, {self.size_swa=}")
 
     def _create_buffers(self, token_to_kv_pool_class, **kwargs):
         self.create_elastic_buffers(token_to_kv_pool_class, **kwargs)

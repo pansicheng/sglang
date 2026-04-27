@@ -27,11 +27,18 @@ USE_ELASTICMEM: bool = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false")
 CU_PAGE_SIZE: int = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
 
 # Thresholds for elastic memory operations
-CAN_UNMAP_THRESHOLD: float = get_float_env_var("SGLANG_CAN_UNMAP_THRESHOLD", 0.3)
+# CAN_UNMAP: pool usage below this is eligible as unmap source
+# CAN_MAP:   pool usage above this is eligible as map target
+# DIFF:      min usage gap between map & unmap candidates to trigger resize
+CAN_UNMAP_THRESHOLD: float = get_float_env_var("SGLANG_CAN_UNMAP_THRESHOLD", 0.5)
 CAN_MAP_THRESHOLD: float = get_float_env_var("SGLANG_CAN_MAP_THRESHOLD", 0.7)
 RESIZE_TRIGGER_DIFF_RATIO: float = get_float_env_var(
     "SGLANG_RESIZE_TRIGGER_DIFF_RATIO", 0.3
 )
+# Number of consecutive try_resize calls where conditions fail before
+# resetting the unmap candidate.  Prevents thrashing when usage oscillates
+# near the threshold boundary.
+RESET_GRACE_STEPS: int = get_int_env_var("SGLANG_RESET_GRACE_STEPS", 10)
 
 # Debug/sanity check flag
 ENABLE_SANITY_CHECK: bool = get_bool_env_var("SGLANG_ELASTIC_MEM_SANITY_CHECK", "false")
@@ -141,6 +148,7 @@ class ElasticMempoolOrchestrator:
         self.allocators: List[ElasticAllocator] = []
         self.remaining_page: int = 0
         self.unmap_candidate: Optional[ElasticAllocator] = None
+        self._grace_counter: int = 0
 
     def register_allocator(self, allocator: ElasticAllocator) -> None:
         allocator.register_emem_orch(self)
@@ -176,6 +184,18 @@ class ElasticMempoolOrchestrator:
         self.unmap_candidate = self.unmap_candidate.mark_unmap_candidate(
             is_candidate=False
         )
+        self._grace_counter = 0
+
+    def _graceful_reset(self):
+        """Reset candidate only after RESET_GRACE_STEPS consecutive failures."""
+        if self.unmap_candidate is None:
+            return
+        self._grace_counter += 1
+        if self._grace_counter >= RESET_GRACE_STEPS:
+            logger.info(
+                f"graceful_reset: resetting candidate after {self._grace_counter} grace steps"
+            )
+            self._reset_unmap_candidate()
 
     def _set_unmap_candidate(self, unmap_candidate):
         if self.unmap_candidate == unmap_candidate:
@@ -188,23 +208,33 @@ class ElasticMempoolOrchestrator:
         map_candidate, unmap_candidate = self._get_candidate_allocator()
 
         if map_candidate is None or unmap_candidate is None:
-            self._reset_unmap_candidate()
+            self._graceful_reset()
             return
 
-        diff = map_candidate.token_usage() - unmap_candidate.token_usage()
+        map_usage = map_candidate.token_usage()
+        unmap_usage = unmap_candidate.token_usage()
+        diff = map_usage - unmap_usage
+
         if diff < RESIZE_TRIGGER_DIFF_RATIO:
-            self._reset_unmap_candidate()
+            self._graceful_reset()
             return
 
         if not map_candidate.can_map() or not unmap_candidate.can_unmap():
-            self._reset_unmap_candidate()
+            self._graceful_reset()
             return
+
+        # Conditions met — reset grace counter
+        self._grace_counter = 0
 
         if self.unmap_candidate is None or not self.unmap_candidate.can_unmap():
             self._set_unmap_candidate(unmap_candidate)
 
         if self.unmap_candidate is None or not self.unmap_candidate.can_do_unmap():
             return
+
+        logger.info(
+            f"try_resize: triggering do_resize, {map_usage=:.3f}, {unmap_usage=:.3f}, {diff=:.3f}"
+        )
 
         self._do_resize(map_candidate, self.unmap_candidate)
 
@@ -218,7 +248,7 @@ class ElasticMempoolOrchestrator:
         logger.info("ElasticMempoolOrchestrator do_resize")
         unmap_page = unmap_allocator.reduce()
         logger.info(
-            f"{unmap_allocator._kvcache.pool_name} unmap {unmap_page}, remain {self.remaining_page} cu_page"
+            f"unmap_allocator unmap {unmap_page}, remain {self.remaining_page} cu_page"
         )
 
         # The approximate number of tokens that can be expanded by mapping cu_page_num cu_pages.
@@ -229,7 +259,7 @@ class ElasticMempoolOrchestrator:
             map_page = map_allocator.expand(map_token)
         self.remaining_page = to_map_page - map_page
         logger.info(
-            f"{map_allocator._kvcache.pool_name} map {map_page}, remain {self.remaining_page} cu_page"
+            f"map_allocator map {map_page}, remain {self.remaining_page} cu_page"
         )
 
         for _allocator in self.allocators:
