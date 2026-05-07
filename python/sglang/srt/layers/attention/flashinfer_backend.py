@@ -21,7 +21,10 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    create_flashinfer_kv_page_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -193,6 +196,8 @@ class FlashInferAttnBackend(AttentionBackend):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+        self.page_size = model_runner.page_size
+        self.use_paged_kv_layout = envs.SGLANG_PAGED_KV_LAYOUT.get()
 
         # Allocate buffers
         global global_workspace_buffer
@@ -955,6 +960,8 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = attn_backend.page_size
+        self.use_paged_kv_layout = attn_backend.use_paged_kv_layout
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1113,28 +1120,59 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
+        actual_page_size = self.page_size if self.use_paged_kv_layout else 1
+
         if spec_info is None:
             bs = len(req_pool_indices)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
 
-            if wrapper.is_cuda_graph_enabled:
-                # Directly write to the cuda graph input buffer
-                kv_indices = wrapper._paged_kv_indices_buf
-            else:
-                kv_indices = torch.empty(
-                    paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+            if actual_page_size > 1:
+                # Paged layout: convert to page-level addressing
+                page_counts = (paged_kernel_lens + actual_page_size - 1) // actual_page_size
+                kv_indptr[1 : bs + 1] = torch.cumsum(page_counts, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+
+                total_pages = kv_indptr[bs].item()
+                if wrapper.is_cuda_graph_enabled:
+                    kv_indices = wrapper._paged_kv_indices_buf
+                else:
+                    kv_indices = torch.empty(
+                        total_pages, dtype=torch.int32, device="cuda"
+                    )
+
+                create_flashinfer_kv_page_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    actual_page_size,
                 )
 
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+                # Compute kv_last_page_len for paged layout
+                self.kv_last_page_len[:bs] = ((paged_kernel_lens - 1) % actual_page_size) + 1
+            else:
+                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+
+                if wrapper.is_cuda_graph_enabled:
+                    # Directly write to the cuda graph input buffer
+                    kv_indices = wrapper._paged_kv_indices_buf
+                else:
+                    kv_indices = torch.empty(
+                        paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+                    )
+
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -1153,7 +1191,11 @@ class FlashInferIndicesUpdaterDecode:
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
-            global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
+            if actual_page_size > 1:
+                page_counts_cpu = (seq_lens_cpu + actual_page_size - 1) // actual_page_size
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(page_counts_cpu, dim=0)
+            else:
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
@@ -1171,7 +1213,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                actual_page_size,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1190,7 +1232,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                actual_page_size,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1218,6 +1260,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = attn_backend.page_size
+        self.use_paged_kv_layout = attn_backend.use_paged_kv_layout
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -1409,26 +1453,55 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
+        actual_page_size = self.page_size if self.use_paged_kv_layout else 1
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
-            # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+
+            if actual_page_size > 1:
+                # Paged layout: convert to page-level addressing
+                page_counts = (paged_kernel_lens + actual_page_size - 1) // actual_page_size
+                kv_indptr[1 : bs + 1] = torch.cumsum(page_counts, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+
+                total_pages = kv_indptr[bs].item()
+                kv_indices = torch.empty(
+                    total_pages + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_flashinfer_kv_page_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    actual_page_size,
+                )
+
+                # Compute kv_last_page_len for paged layout
+                self.kv_last_page_len[:bs] = ((paged_kernel_lens - 1) % actual_page_size) + 1
+            else:
+                # Normal extend
+                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
+
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
@@ -1488,7 +1561,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            actual_page_size,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
