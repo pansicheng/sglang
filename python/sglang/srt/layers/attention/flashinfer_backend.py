@@ -1127,7 +1127,9 @@ class FlashInferIndicesUpdaterDecode:
 
             if actual_page_size > 1:
                 # Paged layout: convert to page-level addressing
-                page_counts = (paged_kernel_lens + actual_page_size - 1) // actual_page_size
+                page_counts = (
+                    paged_kernel_lens + actual_page_size - 1
+                ) // actual_page_size
                 kv_indptr[1 : bs + 1] = torch.cumsum(page_counts, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
@@ -1151,7 +1153,9 @@ class FlashInferIndicesUpdaterDecode:
                 )
 
                 # Compute kv_last_page_len for paged layout
-                self.kv_last_page_len[:bs] = ((paged_kernel_lens - 1) % actual_page_size) + 1
+                self.kv_last_page_len[:bs] = (
+                    (paged_kernel_lens - 1) % actual_page_size
+                ) + 1
             else:
                 kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
@@ -1192,10 +1196,16 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
             if actual_page_size > 1:
-                page_counts_cpu = (seq_lens_cpu + actual_page_size - 1) // actual_page_size
-                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(page_counts_cpu, dim=0)
+                page_counts_cpu = (
+                    seq_lens_cpu + actual_page_size - 1
+                ) // actual_page_size
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    page_counts_cpu, dim=0
+                )
             else:
-                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    seq_lens_cpu, dim=0
+                )
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
@@ -1460,7 +1470,9 @@ class FlashInferIndicesUpdaterPrefill:
 
             if actual_page_size > 1:
                 # Paged layout: convert to page-level addressing
-                page_counts = (paged_kernel_lens + actual_page_size - 1) // actual_page_size
+                page_counts = (
+                    paged_kernel_lens + actual_page_size - 1
+                ) // actual_page_size
                 kv_indptr[1 : bs + 1] = torch.cumsum(page_counts, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
@@ -1482,7 +1494,9 @@ class FlashInferIndicesUpdaterPrefill:
                 )
 
                 # Compute kv_last_page_len for paged layout
-                self.kv_last_page_len[:bs] = ((paged_kernel_lens - 1) % actual_page_size) + 1
+                self.kv_last_page_len[:bs] = (
+                    (paged_kernel_lens - 1) % actual_page_size
+                ) + 1
             else:
                 # Normal extend
                 kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)

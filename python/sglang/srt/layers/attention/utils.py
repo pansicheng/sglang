@@ -91,7 +91,9 @@ def create_flashinfer_kv_page_indices_triton(
             mask=mask,
         )
         # Convert token index to page index
-        tl.store(kv_indices_ptr + kv_indices_offset + offset, data // PAGE_SIZE, mask=mask)
+        tl.store(
+            kv_indices_ptr + kv_indices_offset + offset, data // PAGE_SIZE, mask=mask
+        )
 
 
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:

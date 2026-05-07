@@ -36,7 +36,11 @@ else:
     MODEL_PATH = DEFAULT_MODEL_NAME_FOR_TEST
 
 # Environment with paged KV layout enabled
-PAGED_KV_ENV = {**os.environ, "SGLANG_PAGED_KV_LAYOUT": "1", "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1"}
+PAGED_KV_ENV = {
+    **os.environ,
+    "SGLANG_PAGED_KV_LAYOUT": "1",
+    "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
+}
 
 
 class TestPagedKVLayout(CustomTestCase):
@@ -101,7 +105,6 @@ class TestPagedKVLayout(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-
     def test_mmlu_flashinfer(self):
         """Verify MMLU accuracy with paged KV layout and flashinfer backend."""
         model = MODEL_PATH
@@ -156,7 +159,9 @@ class TestPagedKVLayout(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            print(f"MMLU score with paged KV layout (flashinfer, page_size=16): {metrics['score']}")
+            print(
+                f"MMLU score with paged KV layout (flashinfer, page_size=16): {metrics['score']}"
+            )
             self.assertGreaterEqual(metrics["score"], 0.65)
         finally:
             kill_process_tree(process.pid)
@@ -215,7 +220,9 @@ class TestPagedKVLayout(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            print(f"MMLU score with paged KV layout (torch_native, page_size=16): {metrics['score']}")
+            print(
+                f"MMLU score with paged KV layout (torch_native, page_size=16): {metrics['score']}"
+            )
             self.assertGreaterEqual(metrics["score"], 0.65)
         finally:
             kill_process_tree(process.pid)
@@ -276,7 +283,9 @@ class TestPagedKVLayout(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            print(f"GSM8K score with paged KV layout (triton, page_size=16): {metrics['score']}")
+            print(
+                f"GSM8K score with paged KV layout (triton, page_size=16): {metrics['score']}"
+            )
             self.assertGreaterEqual(metrics["score"], 0.60)
         finally:
             kill_process_tree(process.pid)
@@ -335,7 +344,9 @@ class TestPagedKVLayout(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            print(f"GSM8K score with paged KV layout (flashinfer, page_size=16): {metrics['score']}")
+            print(
+                f"GSM8K score with paged KV layout (flashinfer, page_size=16): {metrics['score']}"
+            )
             self.assertGreaterEqual(metrics["score"], 0.60)
         finally:
             kill_process_tree(process.pid)
@@ -362,7 +373,9 @@ class TestPagedKVLayout(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            print(f"GSM8K score with paged KV layout (torch_native): {metrics['score']}")
+            print(
+                f"GSM8K score with paged KV layout (torch_native): {metrics['score']}"
+            )
             self.assertGreaterEqual(metrics["score"], 0.60)
         finally:
             kill_process_tree(process.pid)
@@ -394,7 +407,9 @@ class TestPagedKVLayout(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            print(f"GSM8K score with paged KV layout (torch_native, page_size=16): {metrics['score']}")
+            print(
+                f"GSM8K score with paged KV layout (torch_native, page_size=16): {metrics['score']}"
+            )
             self.assertGreaterEqual(metrics["score"], 0.60)
         finally:
             kill_process_tree(process.pid)

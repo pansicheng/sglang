@@ -828,7 +828,9 @@ class MHATokenToKVPool(KVCache):
 
         # Validate paged layout invariants after buffer creation
         if self._use_paged_layout:
-            assert hasattr(self, "kv_buffer"), "Paged layout enabled but kv_buffer not created"
+            assert hasattr(
+                self, "kv_buffer"
+            ), "Paged layout enabled but kv_buffer not created"
             # kv_buffer shape: [num_pages, 2, layer_num, tokens_per_page, head_num, head_dim]
             assert self.kv_buffer.shape[0] == self.num_pages, (
                 f"kv_buffer first dim should be num_pages={self.num_pages}, "
@@ -839,9 +841,9 @@ class MHATokenToKVPool(KVCache):
                 f"got {self.kv_buffer.dtype}"
             )
             # Per-layer views: k_buffer[i] shape [P, Tp, H, D]
-            assert self.k_buffer[0].ndim == 4, (
-                f"Paged k_buffer[0] should be 4D [P, Tp, H, D], got shape {self.k_buffer[0].shape}"
-            )
+            assert (
+                self.k_buffer[0].ndim == 4
+            ), f"Paged k_buffer[0] should be 4D [P, Tp, H, D], got shape {self.k_buffer[0].shape}"
             assert self.k_buffer[0].dtype == self.store_dtype, (
                 f"k_buffer dtype mismatch: expected {self.store_dtype}, "
                 f"got {self.k_buffer[0].dtype}"
