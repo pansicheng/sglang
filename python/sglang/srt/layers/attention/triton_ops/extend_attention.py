@@ -251,10 +251,12 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vbs,
-    stride_buf_vh,
+    stride_buf_k_page,
+    stride_buf_k_token,
+    stride_buf_k_head,
+    stride_buf_v_page,
+    stride_buf_v_token,
+    stride_buf_v_head,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -270,6 +272,7 @@ def _fwd_kernel(
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    TOKENS_PER_PAGE: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -371,10 +374,15 @@ def _fwd_kernel(
                 other=0,
             )
 
+            # 2-level paged addressing
+            page_idx = offs_kv_loc // TOKENS_PER_PAGE
+            page_off = offs_kv_loc % TOKENS_PER_PAGE
+
             # load k in transposed way
             offs_buf_k = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
+                page_idx[None, :] * stride_buf_k_page
+                + page_off[None, :] * stride_buf_k_token
+                + cur_kv_head * stride_buf_k_head
                 + offs_d[:, None]
             )
             k = tl.load(
@@ -386,8 +394,9 @@ def _fwd_kernel(
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
-                    offs_kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
+                    page_idx[None, :] * stride_buf_k_page
+                    + page_off[None, :] * stride_buf_k_token
+                    + cur_kv_head * stride_buf_k_head
                     + offs_dpe[:, None]
                 )
                 kpe = tl.load(
@@ -415,8 +424,9 @@ def _fwd_kernel(
             deno = deno * re_scale + tl.sum(p, 1)
 
             offs_buf_v = (
-                offs_kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
+                page_idx[:, None] * stride_buf_v_page
+                + page_off[:, None] * stride_buf_v_token
+                + cur_kv_head * stride_buf_v_head
                 + offs_dv[None, :]
             )
             v = tl.load(
@@ -614,6 +624,26 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    # Compute strides for paged vs non-paged layout
+    if k_buffer.ndim == 4:
+        # Paged layout: [P, Tp, H, D]
+        TOKENS_PER_PAGE = k_buffer.shape[1]
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(1)
+        stride_k_head = k_buffer.stride(2)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(1)
+        stride_v_head = v_buffer.stride(2)
+    else:
+        # Non-paged layout: [T, H, D]
+        TOKENS_PER_PAGE = 1
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(0)
+        stride_k_head = k_buffer.stride(1)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(0)
+        stride_v_head = v_buffer.stride(1)
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -640,10 +670,12 @@ def extend_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        stride_k_page,
+        stride_k_token,
+        stride_k_head,
+        stride_v_page,
+        stride_v_token,
+        stride_v_head,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -659,6 +691,7 @@ def extend_attention_fwd(
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
+        TOKENS_PER_PAGE=TOKENS_PER_PAGE,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
@@ -723,10 +756,12 @@ def _fwd_kernel_unified(
     stride_qh,
     stride_obs,
     stride_oh,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vbs,
-    stride_buf_vh,
+    stride_buf_k_page,
+    stride_buf_k_token,
+    stride_buf_k_head,
+    stride_buf_v_page,
+    stride_buf_v_token,
+    stride_buf_v_head,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -740,6 +775,7 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    TOKENS_PER_PAGE: tl.constexpr,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -875,10 +911,15 @@ def _fwd_kernel_unified(
                 other=0,
             )
 
+            # 2-level paged addressing
+            page_idx = offs_kv_loc // TOKENS_PER_PAGE
+            page_off = offs_kv_loc % TOKENS_PER_PAGE
+
             # Load K
             offs_buf_k = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
+                page_idx[None, :] * stride_buf_k_page
+                + page_off[None, :] * stride_buf_k_token
+                + cur_kv_head * stride_buf_k_head
                 + offs_d[:, None]
             )
             k = tl.load(
@@ -891,8 +932,9 @@ def _fwd_kernel_unified(
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
-                    offs_kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
+                    page_idx[None, :] * stride_buf_k_page
+                    + page_off[None, :] * stride_buf_k_token
+                    + cur_kv_head * stride_buf_k_head
                     + offs_dpe[:, None]
                 )
                 kpe = tl.load(
@@ -923,8 +965,9 @@ def _fwd_kernel_unified(
 
             # Load V
             offs_buf_v = (
-                offs_kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
+                page_idx[:, None] * stride_buf_v_page
+                + page_off[:, None] * stride_buf_v_token
+                + cur_kv_head * stride_buf_v_head
                 + offs_dv[None, :]
             )
             v = tl.load(
@@ -1010,7 +1053,7 @@ def extend_attention_fwd_unified(
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
     USE_CUSTOM_MASK = custom_mask is not None
     HAS_SINK = sinks is not None
@@ -1027,6 +1070,26 @@ def extend_attention_fwd_unified(
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+
+    # Compute strides for paged vs non-paged layout
+    if k_buffer.ndim == 4:
+        # Paged layout: [P, Tp, H, D]
+        TOKENS_PER_PAGE = k_buffer.shape[1]
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(1)
+        stride_k_head = k_buffer.stride(2)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(1)
+        stride_v_head = v_buffer.stride(2)
+    else:
+        # Non-paged layout: [T, H, D]
+        TOKENS_PER_PAGE = 1
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(0)
+        stride_k_head = k_buffer.stride(1)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(0)
+        stride_v_head = v_buffer.stride(1)
 
     _fwd_kernel_unified[grid](
         q,
@@ -1048,10 +1111,12 @@ def extend_attention_fwd_unified(
         q.stride(1),
         o.stride(0),
         o.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        stride_k_page,
+        stride_k_token,
+        stride_k_head,
+        stride_v_page,
+        stride_v_token,
+        stride_v_head,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -1065,6 +1130,7 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        TOKENS_PER_PAGE=TOKENS_PER_PAGE,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

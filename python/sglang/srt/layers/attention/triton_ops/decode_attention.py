@@ -54,10 +54,12 @@ def _fwd_kernel_stage1(
     num_kv_splits,
     stride_qbs,
     stride_qh,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vbs,
-    stride_buf_vh,
+    stride_buf_k_page,
+    stride_buf_k_token,
+    stride_buf_k_head,
+    stride_buf_v_page,
+    stride_buf_v_token,
+    stride_buf_v_head,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -70,6 +72,7 @@ def _fwd_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
     xai_temperature_len: tl.constexpr,
+    TOKENS_PER_PAGE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -113,9 +116,13 @@ def _fwd_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
+            # 2-level paged addressing
+            page_idx = kv_loc // TOKENS_PER_PAGE
+            page_off = kv_loc % TOKENS_PER_PAGE
             offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
+                page_idx[:, None] * stride_buf_k_page
+                + page_off[:, None] * stride_buf_k_token
+                + cur_kv_head * stride_buf_k_head
                 + offs_d[None, :]
             )
             k = tl.load(
@@ -135,8 +142,9 @@ def _fwd_kernel_stage1(
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
             offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
+                page_idx[:, None] * stride_buf_v_page
+                + page_off[:, None] * stride_buf_v_token
+                + cur_kv_head * stride_buf_v_head
                 + offs_dv[None, :]
             )
             v = tl.load(
@@ -204,7 +212,7 @@ def _decode_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
 
     grid = (batch, head_num, MAX_KV_SPLITS)
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
     if kv_group_num == 1:
         num_warps = 4
@@ -215,6 +223,26 @@ def _decode_att_m_fwd(
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
+
+    # Compute strides for paged vs non-paged layout
+    if k_buffer.ndim == 4:
+        # Paged layout: [P, Tp, H, D]
+        TOKENS_PER_PAGE = k_buffer.shape[1]
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(1)
+        stride_k_head = k_buffer.stride(2)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(1)
+        stride_v_head = v_buffer.stride(2)
+    else:
+        # Non-paged layout: [T, H, D]
+        TOKENS_PER_PAGE = 1
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(0)
+        stride_k_head = k_buffer.stride(1)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(0)
+        stride_v_head = v_buffer.stride(1)
 
     _fwd_kernel_stage1[grid](
         q,
@@ -228,10 +256,12 @@ def _decode_att_m_fwd(
         num_kv_splits,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        stride_k_page,
+        stride_k_token,
+        stride_k_head,
+        stride_v_page,
+        stride_v_token,
+        stride_v_head,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -246,6 +276,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        TOKENS_PER_PAGE=TOKENS_PER_PAGE,
     )
 
 
@@ -262,10 +293,12 @@ def _fwd_grouped_kernel_stage1(
     num_kv_splits,
     stride_qbs,
     stride_qh,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vbs,
-    stride_buf_vh,
+    stride_buf_k_page,
+    stride_buf_k_token,
+    stride_buf_k_head,
+    stride_buf_v_page,
+    stride_buf_v_token,
+    stride_buf_v_head,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -281,6 +314,7 @@ def _fwd_grouped_kernel_stage1(
     xai_temperature_len: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    TOKENS_PER_PAGE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -342,9 +376,13 @@ def _fwd_grouped_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
+            # 2-level paged addressing
+            page_idx = kv_loc // TOKENS_PER_PAGE
+            page_off = kv_loc % TOKENS_PER_PAGE
             offs_buf_k = (
-                kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
+                page_idx[None, :] * stride_buf_k_page
+                + page_off[None, :] * stride_buf_k_token
+                + cur_kv_head * stride_buf_k_head
                 + offs_d[:, None]
             )
             k = tl.load(
@@ -355,8 +393,9 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
-                    kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
+                    page_idx[None, :] * stride_buf_k_page
+                    + page_off[None, :] * stride_buf_k_token
+                    + cur_kv_head * stride_buf_k_head
                     + offs_dpe[:, None]
                 )
                 kpe = tl.load(
@@ -378,8 +417,9 @@ def _fwd_grouped_kernel_stage1(
             )
 
             offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
+                page_idx[:, None] * stride_buf_v_page
+                + page_off[:, None] * stride_buf_v_token
+                + cur_kv_head * stride_buf_v_head
                 + offs_dv[None, :]
             )
             v = tl.load(
@@ -457,7 +497,7 @@ def _decode_grouped_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     batch, head_num = q.shape[0], q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
     BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
@@ -475,6 +515,26 @@ def _decode_grouped_att_m_fwd(
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
 
+    # Compute strides for paged vs non-paged layout
+    if k_buffer.ndim == 4:
+        # Paged layout: [P, Tp, H, D]
+        TOKENS_PER_PAGE = k_buffer.shape[1]
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(1)
+        stride_k_head = k_buffer.stride(2)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(1)
+        stride_v_head = v_buffer.stride(2)
+    else:
+        # Non-paged layout: [T, H, D]
+        TOKENS_PER_PAGE = 1
+        stride_k_page = k_buffer.stride(0)
+        stride_k_token = k_buffer.stride(0)
+        stride_k_head = k_buffer.stride(1)
+        stride_v_page = v_buffer.stride(0)
+        stride_v_token = v_buffer.stride(0)
+        stride_v_head = v_buffer.stride(1)
+
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
@@ -487,10 +547,12 @@ def _decode_grouped_att_m_fwd(
         num_kv_splits,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        stride_k_page,
+        stride_k_token,
+        stride_k_head,
+        stride_v_page,
+        stride_v_token,
+        stride_v_head,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -508,6 +570,7 @@ def _decode_grouped_att_m_fwd(
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
+        TOKENS_PER_PAGE=TOKENS_PER_PAGE,
         **extra_kargs,
     )
 
@@ -745,7 +808,7 @@ def decode_attention_fwd(
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
 
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    kv_group_num = q.shape[1] // v_buffer.shape[-2]
 
     if kv_group_num == 1:
         # MHA

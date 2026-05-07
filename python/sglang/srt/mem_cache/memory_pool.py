@@ -815,7 +815,46 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
+        # Paged KV layout: [page_num, 2, layer, tokens_per_page, head_num, head_dim]
+        # Requires env var set and head_dim == v_head_dim
+        self._use_paged_layout = (
+            envs.SGLANG_PAGED_KV_LAYOUT.get() and self.head_dim == self.v_head_dim
+        )
+        if self._use_paged_layout:
+            self.num_pages = (self.size + self.page_size) // self.page_size
+            self.tokens_per_page = self.page_size
+
         self._create_buffers()
+
+        # Validate paged layout invariants after buffer creation
+        if self._use_paged_layout:
+            assert hasattr(self, "kv_buffer"), "Paged layout enabled but kv_buffer not created"
+            # kv_buffer shape: [num_pages, 2, layer_num, tokens_per_page, head_num, head_dim]
+            assert self.kv_buffer.shape[0] == self.num_pages, (
+                f"kv_buffer first dim should be num_pages={self.num_pages}, "
+                f"got {self.kv_buffer.shape[0]}"
+            )
+            assert self.kv_buffer.dtype == self.store_dtype, (
+                f"kv_buffer dtype mismatch: expected {self.store_dtype}, "
+                f"got {self.kv_buffer.dtype}"
+            )
+            # Per-layer views: k_buffer[i] shape [P, Tp, H, D]
+            assert self.k_buffer[0].ndim == 4, (
+                f"Paged k_buffer[0] should be 4D [P, Tp, H, D], got shape {self.k_buffer[0].shape}"
+            )
+            assert self.k_buffer[0].dtype == self.store_dtype, (
+                f"k_buffer dtype mismatch: expected {self.store_dtype}, "
+                f"got {self.k_buffer[0].dtype}"
+            )
+            logger.info(
+                "Paged KV layout enabled: kv_buffer shape=%s, dtype=%s, "
+                "num_pages=%d, tokens_per_page=%d, layers=%d",
+                list(self.kv_buffer.shape),
+                self.kv_buffer.dtype,
+                self.num_pages,
+                self.tokens_per_page,
+                self.layer_num,
+            )
 
         self.device_module = torch.get_device_module(self.device)
 
@@ -826,7 +865,7 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
-        if enable_kv_cache_copy:
+        if enable_kv_cache_copy and not self._use_paged_layout:
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -891,24 +930,51 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
+                if self._use_paged_layout:
+                    # Paged layout: [num_pages, 2, layer_num, tokens_per_page, head_num, head_dim]
+                    self.kv_buffer = torch.zeros(
+                        (
+                            self.num_pages,
+                            2,
+                            self.layer_num,
+                            self.tokens_per_page,
+                            self.head_num,
+                            self.head_dim,
+                        ),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                    # Per-layer views: shape [P, Tp, H, D], non-contiguous between pages
+                    self.k_buffer = [
+                        self.kv_buffer[:, 0, i] for i in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        self.kv_buffer[:, 1, i] for i in range(self.layer_num)
+                    ]
+                else:
+                    # Original path: separate per-layer tensors
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.v_head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -932,8 +998,13 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if self._use_paged_layout:
+            del self.kv_buffer
 
     def get_kv_size_bytes(self):
+        if self._use_paged_layout:
+            kv_size = get_tensor_size_bytes(self.kv_buffer)
+            return kv_size // 2, kv_size // 2
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
         k_size_bytes = 0
@@ -962,13 +1033,45 @@ class MHATokenToKVPool(KVCache):
             self._get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
+        # For paged layout, buffer[0] is already one page [tokens_per_page, H, D],
+        # so .nbytes is the per-page size — no extra multiplication needed.
+        # For flat layout, buffer[0] is one token [H, D], multiply by page_size.
+        if self._use_paged_layout:
+            # Paged: _get_key_buffer(i) has ndim == 4: [num_pages, Tp, H, D]
+            #        _get_key_buffer(i)[0] has shape [Tp, H, D] (one page)
+            k_buf = self._get_key_buffer(self.start_layer)
+            v_buf = self._get_value_buffer(self.start_layer)
+            assert (
+                k_buf.ndim == 4
+            ), f"Paged layout expects 4D key buffer [P, Tp, H, D], got {k_buf.shape}"
+            assert (
+                v_buf.ndim == 4
+            ), f"Paged layout expects 4D value buffer [P, Tp, H, D], got {v_buf.shape}"
+            assert k_buf.shape[1] == self.tokens_per_page, (
+                f"Page token dim mismatch: buffer dim1={k_buf.shape[1]} vs "
+                f"tokens_per_page={self.tokens_per_page}"
+            )
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            # Flat: _get_key_buffer(i) has ndim == 3: [seq_len, H, D]
+            #       _get_key_buffer(i)[0] has shape [H, D] (one token)
+            k_buf = self._get_key_buffer(self.start_layer)
+            assert (
+                k_buf.ndim == 3
+            ), f"Flat layout expects 3D key buffer [T, H, D], got {k_buf.shape}"
+            kv_item_lens = [
+                self._get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self._get_value_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
@@ -977,14 +1080,21 @@ class MHATokenToKVPool(KVCache):
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
+            k_cache = self.k_buffer[layer_id]
+            v_cache = self.v_buffer[layer_id]
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_cpu = self.k_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
-                v_cpu = self.v_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
+                if self._use_paged_layout:
+                    # 2-level addressing: indices are flat token locations
+                    # k_cache shape: [num_pages, tokens_per_page, H, D]
+                    page_idx = chunk_indices // self.tokens_per_page
+                    offset = chunk_indices % self.tokens_per_page
+                    k_cpu = k_cache[page_idx, offset].to("cpu", non_blocking=True)
+                    v_cpu = v_cache[page_idx, offset].to("cpu", non_blocking=True)
+                else:
+                    # Flat layout: k_cache shape [T, H, D]
+                    k_cpu = k_cache[chunk_indices].to("cpu", non_blocking=True)
+                    v_cpu = v_cache[chunk_indices].to("cpu", non_blocking=True)
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
         torch.cuda.synchronize()
         return kv_cache_cpu
@@ -993,6 +1103,8 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
+            k_cache = self.k_buffer[layer_id]
+            v_cache = self.v_buffer[layer_id]
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu, v_cpu = (
@@ -1000,10 +1112,19 @@ class MHATokenToKVPool(KVCache):
                     kv_cache_cpu[layer_id][i // chunk_size][1],
                 )
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                self.k_buffer[layer_id][chunk_indices] = k_chunk
-                self.v_buffer[layer_id][chunk_indices] = v_chunk
+                k_chunk = k_cpu.to(k_cache.device, non_blocking=True)
+                v_chunk = v_cpu.to(v_cache.device, non_blocking=True)
+                if self._use_paged_layout:
+                    # 2-level addressing: indices are flat token locations
+                    # k_cache shape: [num_pages, tokens_per_page, H, D]
+                    page_idx = chunk_indices // self.tokens_per_page
+                    offset = chunk_indices % self.tokens_per_page
+                    k_cache[page_idx, offset] = k_chunk
+                    v_cache[page_idx, offset] = v_chunk
+                else:
+                    # Flat layout: k_cache shape [T, H, D]
+                    k_cache[chunk_indices] = k_chunk
+                    v_cache[chunk_indices] = v_chunk
         torch.cuda.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
@@ -1060,20 +1181,42 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        _set_kv_buffer_impl(
-            cache_k,
-            cache_v,
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-            loc,
-            row_dim=self.row_dim,
-            store_dtype=self.store_dtype,
-            device_module=self.device_module,
-            alt_stream=self.alt_stream,
-            same_kv_dim=self.same_kv_dim,
-        )
+        if self._use_paged_layout:
+            # 2-level indexing for paged layout
+            k_cache = self.k_buffer[layer_id - self.start_layer]
+            v_cache = self.v_buffer[layer_id - self.start_layer]
+            page_idx = loc // self.tokens_per_page
+            offset = loc % self.tokens_per_page
+            k_cache[page_idx, offset] = cache_k
+            v_cache[page_idx, offset] = cache_v
+        else:
+            _set_kv_buffer_impl(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc,
+                row_dim=self.row_dim,
+                store_dtype=self.store_dtype,
+                device_module=self.device_module,
+                alt_stream=self.alt_stream,
+                same_kv_dim=self.same_kv_dim,
+            )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self._use_paged_layout:
+            # 2-level indexing for paged layout
+            if tgt_loc.numel() == 0:
+                return
+            tgt_page = tgt_loc // self.tokens_per_page
+            tgt_off = tgt_loc % self.tokens_per_page
+            src_page = src_loc // self.tokens_per_page
+            src_off = src_loc % self.tokens_per_page
+            for k_cache, v_cache in zip(self.k_buffer, self.v_buffer):
+                k_cache[tgt_page, tgt_off] = k_cache[src_page, src_off]
+                v_cache[tgt_page, tgt_off] = v_cache[src_page, src_off]
+            return
+
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return

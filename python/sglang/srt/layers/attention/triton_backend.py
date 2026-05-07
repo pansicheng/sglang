@@ -880,8 +880,14 @@ class TritonAttnBackend(AttentionBackend):
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
                 cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
-            k = k_buffer[cache_loc]
-            v = v_buffer[cache_loc]
+            if k_buffer.ndim == 4:
+                # Paged layout: [P, Tp, H, D] — use 2-level indexing
+                tp = k_buffer.shape[1]
+                k = k_buffer[cache_loc // tp, cache_loc % tp]
+                v = v_buffer[cache_loc // tp, cache_loc % tp]
+            else:
+                k = k_buffer[cache_loc]
+                v = v_buffer[cache_loc]
         elif k is None or v is None:
             raise ValueError("Both k and v should be None or not None")
         else:
