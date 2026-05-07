@@ -102,5 +102,65 @@ class TestPagedKVLayout(CustomTestCase):
             kill_process_tree(process.pid)
 
 
+    def test_mmlu_torch_native(self):
+        """Verify MMLU accuracy with paged KV layout and torch_native backend."""
+        model = MODEL_PATH
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--attention-backend", "torch_native"],
+            env=PAGED_KV_ENV,
+        )
+
+        try:
+            args = SimpleNamespace(
+                base_url=base_url,
+                model=model,
+                eval_name="mmlu",
+                num_examples=64,
+                num_threads=32,
+            )
+
+            metrics = run_eval(args)
+            print(f"MMLU score with paged KV layout (torch_native): {metrics['score']}")
+            self.assertGreaterEqual(metrics["score"], 0.65)
+        finally:
+            kill_process_tree(process.pid)
+
+    def test_mmlu_torch_native_page_size_16(self):
+        """Verify MMLU accuracy with paged KV layout, torch_native backend, page_size=16."""
+        model = MODEL_PATH
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--attention-backend",
+                "torch_native",
+                "--page-size",
+                "16",
+            ],
+            env=PAGED_KV_ENV,
+        )
+
+        try:
+            args = SimpleNamespace(
+                base_url=base_url,
+                model=model,
+                eval_name="mmlu",
+                num_examples=64,
+                num_threads=32,
+            )
+
+            metrics = run_eval(args)
+            print(f"MMLU score with paged KV layout (torch_native, page_size=16): {metrics['score']}")
+            self.assertGreaterEqual(metrics["score"], 0.65)
+        finally:
+            kill_process_tree(process.pid)
+
+
 if __name__ == "__main__":
     unittest.main()

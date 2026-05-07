@@ -24,6 +24,30 @@ class TorchNativeAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         pass
 
+    def _gather_kv(self, k_cache, v_cache, token_indices):
+        """Gather KV entries by token indices, handling both flat and paged layouts.
+
+        Args:
+            k_cache: [T, H, D] (flat) or [P, Tp, H, D] (paged)
+            v_cache: same shape as k_cache
+            token_indices: [seq_len] flat token locations
+
+        Returns:
+            (k, v): both [seq_len, H, D]
+        """
+        if k_cache.ndim == 4:
+            # Paged layout: 2-level addressing
+            tokens_per_page = k_cache.shape[1]
+            page_idx = token_indices // tokens_per_page
+            offset = token_indices % tokens_per_page
+            k = k_cache[page_idx, offset]
+            v = v_cache[page_idx, offset]
+        else:
+            # Flat layout: direct indexing
+            k = k_cache[token_indices]
+            v = v_cache[token_indices]
+        return k, v
+
     def _run_sdpa_forward_extend(
         self,
         query: torch.Tensor,
@@ -90,8 +114,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_k, per_req_v = self._gather_kv(k_cache, v_cache, per_req_tokens)
+            per_req_key = per_req_k.movedim(0, query.dim() - 2)
+            per_req_value = per_req_v.movedim(0, query.dim() - 2)
 
             if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
                 # scaled_dot_product_attention() expects query, key, and value to have the same dtype
@@ -164,8 +189,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_k, per_req_v = self._gather_kv(k_cache, v_cache, per_req_tokens)
+            per_req_key = per_req_k.movedim(0, query.dim() - 2)
+            per_req_value = per_req_v.movedim(0, query.dim() - 2)
 
             if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
                 # scaled_dot_product_attention() expects query, key, and value to have the same dtype
