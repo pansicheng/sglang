@@ -52,6 +52,153 @@ def create_flashinfer_kv_indices_triton(
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
+@triton.jit
+def token_indices_to_page_indices_triton(
+    token_kv_indptr,  # [bs+1] cumulative count of token ids per sequence
+    page_kv_indptr,  # [bs+1] cumulative count of page ids per sequence
+    token_kv_indices_ptr,  # [total_tokens] flat token ids produced by create_flashinfer_kv_indices_triton
+    page_kv_indices_ptr,  # [total_pages] output page ids
+    PAGE_SIZE: tl.constexpr,
+):
+    """Compress per-sequence contiguous token-id runs into their page ids.
+
+    Paged allocator invariant: each sequence occupies whole pages except the
+    last page may be partial, and token ids within a page are contiguous.
+    So we can sample the first token id of every page (stride = PAGE_SIZE)
+    and divide by PAGE_SIZE to obtain the page id.
+    """
+    BLOCK_SIZE: tl.constexpr = 256
+    pid = tl.program_id(axis=0)
+
+    token_start = tl.load(token_kv_indptr + pid).to(tl.int64)
+    page_start = tl.load(page_kv_indptr + pid).to(tl.int64)
+    page_end = tl.load(page_kv_indptr + pid + 1).to(tl.int64)
+    num_pages = page_end - page_start
+
+    num_loop = tl.cdiv(num_pages, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = offset < num_pages
+        token_id = tl.load(
+            token_kv_indices_ptr + token_start + offset * PAGE_SIZE,
+            mask=mask,
+        )
+        tl.store(
+            page_kv_indices_ptr + page_start + offset,
+            token_id // PAGE_SIZE,
+            mask=mask,
+        )
+
+
+@triton.jit
+def build_paged_kv_metadata_triton(
+    paged_kernel_lens_ptr,  # [bs] per-seq live KV token count
+    kv_indptr_ptr,  # [>= bs+1] output: cumulative num_pages
+    kv_last_page_len_ptr,  # [>= bs]   output: last page fill (1..page_size)
+    bs,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Single-block scan producing kv_indptr and kv_last_page_len.
+
+    Replaces the following host-side chain per call_begin_forward:
+        num_pages_per_seq = (paged_kernel_lens + ps - 1) // ps
+        kv_indptr[1:bs+1] = cumsum(num_pages_per_seq)
+        last_len = paged_kernel_lens - (num_pages_per_seq - 1) * ps
+        kv_last_page_len[:bs] = where(num_pages_per_seq > 0, last_len, 1)
+    Collapses ~8 small CUDA kernels into one launch.
+    """
+    offs = tl.arange(0, BLOCK)
+    mask = offs < bs
+    lens = tl.load(paged_kernel_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    num_pages = (lens + PAGE_SIZE - 1) // PAGE_SIZE
+    last_len = lens - (num_pages - 1) * PAGE_SIZE
+    last_len = tl.where(num_pages > 0, last_len, 1)
+    # Inclusive scan: kv_indptr[i+1] = sum(num_pages[0..i]). kv_indptr[0] = 0.
+    cum = tl.cumsum(num_pages, axis=0)
+    tl.store(kv_indptr_ptr + offs + 1, cum, mask=mask)
+    tl.store(kv_indptr_ptr + offs, 0, mask=(offs == 0))
+    tl.store(kv_last_page_len_ptr + offs, last_len, mask=mask)
+
+
+@triton.jit
+def build_paged_prefill_metadata_triton(
+    paged_kernel_lens_ptr,  # [bs]
+    seq_lens_ptr,  # [bs]
+    prefix_lens_ptr,  # [bs]
+    kv_indptr_ptr,  # [>= bs+1] output
+    kv_last_page_len_ptr,  # [>= bs]   output
+    qo_indptr_ptr,  # [>= bs+1] output: cumsum(seq_lens - prefix_lens)
+    bs,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Prefill variant: also scans qo_indptr in the same kernel."""
+    offs = tl.arange(0, BLOCK)
+    mask = offs < bs
+    lens = tl.load(paged_kernel_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    num_pages = (lens + PAGE_SIZE - 1) // PAGE_SIZE
+    last_len = lens - (num_pages - 1) * PAGE_SIZE
+    last_len = tl.where(num_pages > 0, last_len, 1)
+    cum_kv = tl.cumsum(num_pages, axis=0)
+    tl.store(kv_indptr_ptr + offs + 1, cum_kv, mask=mask)
+    tl.store(kv_indptr_ptr + offs, 0, mask=(offs == 0))
+    tl.store(kv_last_page_len_ptr + offs, last_len, mask=mask)
+
+    sl = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    pl = tl.load(prefix_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    cum_qo = tl.cumsum(sl - pl, axis=0)
+    tl.store(qo_indptr_ptr + offs + 1, cum_qo, mask=mask)
+    tl.store(qo_indptr_ptr + offs, 0, mask=(offs == 0))
+
+
+@triton.jit
+def fill_paged_kv_indices_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,  # [bs]
+    kv_start_idx_ptr,  # [bs] or nullable
+    kv_indptr_ptr,  # [bs+1] page-level cumulative, already built
+    kv_indices_ptr,  # [total_pages] output page ids
+    req_to_token_ptr_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Directly fill page-indexed kv_indices from req_to_token.
+
+    Replaces the create_flashinfer_kv_indices + token_indices_to_page_indices
+    two-kernel chain. Exploits the allocator invariant that token ids inside
+    a page are contiguous: the page id is just the first-token id of each
+    page // PAGE_SIZE. We read req_to_token with stride PAGE_SIZE, skipping
+    page_size-1 of every page_size tokens (no token-level intermediate).
+    """
+    pid = tl.program_id(axis=0)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    out_start = tl.load(kv_indptr_ptr + pid).to(tl.int64)
+    out_end = tl.load(kv_indptr_ptr + pid + 1).to(tl.int64)
+    num_pages = out_end - out_start
+
+    kv_start = tl.zeros([], dtype=tl.int64)
+    if kv_start_idx_ptr:
+        kv_start = tl.load(kv_start_idx_ptr + pid).to(tl.int64)
+
+    num_loop = tl.cdiv(num_pages, BLOCK)
+    for i in range(num_loop):
+        offs = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+        mask = offs < num_pages
+        token_id = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offs * PAGE_SIZE,
+            mask=mask,
+        )
+        tl.store(
+            kv_indices_ptr + out_start + offs,
+            token_id // PAGE_SIZE,
+            mask=mask,
+        )
+
+
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
     return num_page_per_block

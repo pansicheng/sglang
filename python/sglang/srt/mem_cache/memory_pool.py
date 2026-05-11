@@ -36,7 +36,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.jit_kernel.kvcache import (
+    can_use_store_cache,
+    can_use_store_paged_cache,
+    store_cache,
+    store_paged_cache,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -815,6 +820,19 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
+        self._paged_kv_layout = envs.SGLANG_PAGED_KV_LAYOUT.get()
+        if self._paged_kv_layout:
+            assert (
+                self.head_dim == self.v_head_dim
+            ), "SGLANG_PAGED_KV_LAYOUT phase 1 requires k_head_dim == v_head_dim"
+            assert (
+                self.size % self.page_size == 0
+            ), "SGLANG_PAGED_KV_LAYOUT requires size to be a multiple of page_size"
+            logger.info(
+                "Using paged_kv_layout (SGLANG_PAGED_KV_LAYOUT=1, page_size=%d)",
+                self.page_size,
+            )
+
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -837,7 +855,25 @@ class MHATokenToKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
+        # Paged-layout fast path: precompute shape-derived scalars and a flat
+        # 2-D view over the contiguous [P, 2, L, S, H, D] storage so that per
+        # set_kv_buffer call we avoid re-deriving them (each .view()/.shape
+        # access otherwise lowers to a captured op under CUDA graphs).
+        if self._paged_kv_layout:
+            self._paged_num_layers = self.layer_num
+            self._paged_page_size = self.page_size
+            self._paged_row_bytes = self.row_dim * self._kv_storage.element_size()
+            self._paged_kv_storage_flat = self._kv_storage.view(-1, self.row_dim)
+            assert can_use_store_paged_cache(self._paged_row_bytes), (
+                f"SGLANG_PAGED_KV_LAYOUT requires the paged JIT store kernel, "
+                f"but can_use_store_paged_cache(row_bytes={self._paged_row_bytes}) "
+                f"returned False"
+            )
+
     def _init_kv_copy_and_warmup(self):
+        assert (
+            not self._paged_kv_layout
+        ), "enable_kv_cache_copy is not supported under SGLANG_PAGED_KV_LAYOUT phase 1"
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
@@ -885,6 +921,9 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        if self._paged_kv_layout:
+            self._create_buffers_paged()
+            return
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -929,6 +968,37 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
 
+    def _create_buffers_paged(self):
+        # Single contiguous tensor: [P, 2, L, S, H, D]
+        #   P = num_pages (includes dummy page 0 for padded/dummy writes)
+        #   2 = K/V
+        #   L = layer_num, S = page_size, H = head_num, D = head_dim
+        num_pages = (self.size // self.page_size) + 1
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                self._kv_storage = torch.zeros(
+                    (
+                        num_pages,
+                        2,
+                        self.layer_num,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+        # Per-layer [P, S, H, D] views for backend consumers (FlashInfer NHD layout)
+        self._k_storage = self._kv_storage[:, 0]  # [P, L, S, H, D]
+        self._v_storage = self._kv_storage[:, 1]
+        self.k_buffer = [self._k_storage[:, i] for i in range(self.layer_num)]
+        self.v_buffer = [self._v_storage[:, i] for i in range(self.layer_num)]
+        # Data ptrs/strides are unused in the paged write path (advanced indexing).
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
@@ -972,6 +1042,9 @@ class MHATokenToKVPool(KVCache):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        assert (
+            not self._paged_kv_layout
+        ), "CPU offloading is not supported under SGLANG_PAGED_KV_LAYOUT phase 1"
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -990,6 +1063,9 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        assert (
+            not self._paged_kv_layout
+        ), "CPU offloading is not supported under SGLANG_PAGED_KV_LAYOUT phase 1"
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1060,6 +1136,23 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
+        if self._paged_kv_layout:
+            # Paged [P, 2, L, S, H, D] write: dispatch the JIT store_paged_cache
+            # kernel which derives destination rows from ``loc + layer_idx +
+            # page_size`` in-kernel, so no Python-side index tensor is built.
+            layer_idx = layer_id - self.start_layer
+            store_paged_cache(
+                cache_k.reshape(-1, self.row_dim),
+                cache_v.reshape(-1, self.row_dim),
+                self._paged_kv_storage_flat,
+                loc,
+                layer_idx,
+                self._paged_page_size,
+                self._paged_num_layers,
+                row_bytes=self._paged_row_bytes,
+            )
+            return
+
         _set_kv_buffer_impl(
             cache_k,
             cache_v,
@@ -1074,6 +1167,9 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        assert (
+            not self._paged_kv_layout
+        ), "move_kv_cache is not supported under SGLANG_PAGED_KV_LAYOUT phase 1"
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
@@ -1126,6 +1222,9 @@ class MHATokenToKVPool(KVCache):
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):
+        assert (
+            not envs.SGLANG_PAGED_KV_LAYOUT.get()
+        ), "MHATokenToKVPoolFP4 is out of scope for SGLANG_PAGED_KV_LAYOUT phase 1"
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1511,6 +1610,9 @@ class MLATokenToKVPool(KVCache):
         use_nsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
     ):
+        assert (
+            not envs.SGLANG_PAGED_KV_LAYOUT.get()
+        ), "MLATokenToKVPool is out of scope for SGLANG_PAGED_KV_LAYOUT phase 1"
         super().__init__(
             size,
             page_size,
@@ -1732,6 +1834,9 @@ class MLATokenToKVPool(KVCache):
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
     def _create_buffers(self):
+        assert (
+            not envs.SGLANG_PAGED_KV_LAYOUT.get()
+        ), "MLATokenToKVPoolFP4 is out of scope for SGLANG_PAGED_KV_LAYOUT phase 1"
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)

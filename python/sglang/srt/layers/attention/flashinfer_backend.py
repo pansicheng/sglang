@@ -21,7 +21,12 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    build_paged_kv_metadata_triton,
+    build_paged_prefill_metadata_triton,
+    create_flashinfer_kv_indices_triton,
+    fill_paged_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -194,6 +199,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
+        # Paged KV layout (phase 1): drive FlashInfer with real page_size and
+        # page-indexed kv_indices instead of token-indexed with page_size=1.
+        self.paged_kv_layout = envs.SGLANG_PAGED_KV_LAYOUT.get()
+        if self.paged_kv_layout:
+            self.kv_page_size = model_runner.token_to_kv_pool_allocator.page_size
+        else:
+            self.kv_page_size = 1
+
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
@@ -239,6 +252,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 for _ in range(self.num_wrappers)
             ]
+
+        # Paged-layout metadata scan BLOCK: the fused-metadata kernel runs as a
+        # single program and block-scans over the whole batch, so BLOCK must be
+        # a compile-time power-of-2 >= max batch. Fixed at backend init so the
+        # kernel JIT-compiles once.
+        if self.paged_kv_layout:
+            self.paged_scan_block = next_power_of_2(max_bs + 1)
 
         fmha_backend = "auto"
         if is_sm100_supported():
@@ -962,6 +982,13 @@ class FlashInferIndicesUpdaterDecode:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
+        self.paged_kv_layout = attn_backend.paged_kv_layout
+        self.kv_page_size = attn_backend.kv_page_size
+
+        # Scan BLOCK size for the fused paged metadata kernel (owned by backend).
+        if self.paged_kv_layout:
+            self.paged_scan_block = attn_backend.paged_scan_block
+
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             self.update = self.update_sliding_window
@@ -1113,7 +1140,48 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        if spec_info is None:
+        if self.paged_kv_layout:
+            assert (
+                spec_info is None
+            ), "Speculative decoding is unsupported under SGLANG_PAGED_KV_LAYOUT phase 1"
+            assert (
+                not use_sliding_window_kv_pool
+            ), "SWA + SGLANG_PAGED_KV_LAYOUT is out of scope for phase 1"
+            bs = len(req_pool_indices)
+            page_size = self.kv_page_size
+            # Kernel 1: single-block scan -> kv_indptr[0..bs] + kv_last_page_len[:bs].
+            # Folds cumsum / elementwise / where / slice-assign chain into one launch.
+            build_paged_kv_metadata_triton[(1,)](
+                paged_kernel_lens,
+                kv_indptr,
+                self.kv_last_page_len,
+                bs,
+                PAGE_SIZE=page_size,
+                BLOCK=self.paged_scan_block,
+            )
+            kv_indptr = kv_indptr[: bs + 1]
+            # Allocate (or alias) page-indexed kv_indices.
+            if wrapper.is_cuda_graph_enabled:
+                kv_indices = wrapper._paged_kv_indices_buf
+            else:
+                total_pages_ub = paged_kernel_lens_sum // page_size + bs + 1
+                kv_indices = torch.empty(
+                    total_pages_ub, dtype=torch.int32, device="cuda"
+                )
+            # Kernel 2: directly fill page ids from req_to_token (stride PAGE_SIZE).
+            # Collapses create_flashinfer_kv_indices + token_indices_to_page_indices
+            # chain and drops the token-level intermediate buffer entirely.
+            fill_paged_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_start_idx,
+                kv_indptr,
+                kv_indices,
+                self.req_to_token.shape[1],
+                PAGE_SIZE=page_size,
+                BLOCK=256,
+            )
+        elif spec_info is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -1139,7 +1207,7 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not self.paged_kv_layout:
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
                 self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1171,7 +1239,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                self.kv_page_size,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1190,7 +1258,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                self.kv_page_size,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1225,6 +1293,13 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+
+        self.paged_kv_layout = attn_backend.paged_kv_layout
+        self.kv_page_size = attn_backend.kv_page_size
+
+        # Scan BLOCK size for the fused paged metadata kernel (owned by backend).
+        if self.paged_kv_layout:
+            self.paged_scan_block = attn_backend.paged_scan_block
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1410,7 +1485,50 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
-        if spec_info is None:
+        if self.paged_kv_layout:
+            assert (
+                spec_info is None
+            ), "Speculative decoding is unsupported under SGLANG_PAGED_KV_LAYOUT phase 1"
+            assert len(seq_lens) == len(req_pool_indices)
+            assert (
+                not use_sliding_window_kv_pool
+            ), "SWA + SGLANG_PAGED_KV_LAYOUT is out of scope for phase 1"
+            page_size = self.kv_page_size
+            # Kernel 1: single-block scan produces kv_indptr + kv_last_page_len
+            # + qo_indptr in one launch, replacing ~3 cumsums and the elementwise
+            # / where chain.
+            build_paged_prefill_metadata_triton[(1,)](
+                paged_kernel_lens,
+                seq_lens,
+                prefix_lens,
+                kv_indptr,
+                self.kv_last_page_len,
+                qo_indptr,
+                bs,
+                PAGE_SIZE=page_size,
+                BLOCK=self.paged_scan_block,
+            )
+            kv_indptr = kv_indptr[: bs + 1]
+            qo_indptr = qo_indptr[: bs + 1]
+            total_pages_ub = paged_kernel_lens_sum // page_size + bs + 1
+            kv_indices = torch.empty(
+                total_pages_ub,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+            # Kernel 2: directly fill page ids from req_to_token (stride PAGE_SIZE).
+            fill_paged_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_start_idx,
+                kv_indptr,
+                kv_indices,
+                self.req_to_token.shape[1],
+                PAGE_SIZE=page_size,
+                BLOCK=256,
+            )
+            custom_mask = cross_attention_custom_mask
+        elif spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1455,7 +1573,7 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not self.paged_kv_layout:
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
                 self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1488,7 +1606,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            self.kv_page_size,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,

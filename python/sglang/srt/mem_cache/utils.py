@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.kvcache import store_cache
 from sglang.srt.environ import envs
 
 
@@ -320,6 +321,67 @@ def get_mla_kv_buffer_triton(
         cache_k_rope.stride(0),
         nope_dim,
         rope_dim,
+    )
+
+
+def store_paged_kv_via_store_cache(
+    kv_storage: torch.Tensor,
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    loc: torch.Tensor,
+    layer_idx: int,
+    page_size: int,
+) -> None:
+    """Fused K+V write for paged [P, 2, L, S, H, D] via hand-tuned store_cache.
+
+    Reuses sgl_kernel's ``store_cache`` (vectorized + PDL) by:
+      1. Flattening ``kv_storage`` to ``[P*2*L*S, H*D]`` rows (view, no copy).
+      2. Building a same-storage V view offset by ``L*S`` rows through
+         ``as_strided``; K and V then share one ``indices`` tensor.
+      3. Precomputing the K flat row index
+         ``(loc // page_size) * (2*L*S) + layer_idx*S + (loc % page_size)``.
+
+    Caller must gate on ``can_use_store_cache(row_bytes)``.
+    """
+    assert kv_storage.is_contiguous(), "kv_storage must be contiguous"
+    assert kv_storage.dim() == 6 and kv_storage.shape[1] == 2
+    _, _, num_layers, page_sz, head_num, head_dim = kv_storage.shape
+    assert page_sz == page_size
+    row_dim = head_num * head_dim
+    n_loc = loc.numel()
+    if n_loc == 0:
+        return
+
+    ls = num_layers * page_sz  # rows between K and V halves of the same page
+    flat_full = kv_storage.view(-1, row_dim)
+    # K and V views must have matching shapes for store_cache. K indices cap
+    # at (flat_rows - ls - 1), so size both views to (flat_rows - ls, row_dim):
+    # K at offset 0, V at offset ls*row_dim.
+    k_flat = torch.as_strided(
+        flat_full,
+        size=(flat_full.shape[0] - ls, row_dim),
+        stride=flat_full.stride(),
+        storage_offset=flat_full.storage_offset(),
+    )
+    v_flat = torch.as_strided(
+        flat_full,
+        size=(flat_full.shape[0] - ls, row_dim),
+        stride=flat_full.stride(),
+        storage_offset=flat_full.storage_offset() + ls * row_dim,
+    )
+
+    # Per-token K flat-row index; V uses the same index via v_flat's offset.
+    page_idx = torch.div(loc, page_size, rounding_mode="floor")
+    slot = loc - page_idx * page_size
+    indices = page_idx * (2 * ls) + (layer_idx * page_sz + slot)
+
+    store_cache(
+        cache_k.reshape(-1, row_dim),
+        cache_v.reshape(-1, row_dim),
+        k_flat,
+        v_flat,
+        indices,
+        row_bytes=row_dim * kv_storage.element_size(),
     )
 
 
