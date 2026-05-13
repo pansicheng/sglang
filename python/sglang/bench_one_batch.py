@@ -764,8 +764,10 @@ def latency_test_run_once(
             )
 
         tic = time.perf_counter()
+        torch.cuda.nvtx.range_push(f"decode_step_{i}")
         next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
+        torch.cuda.nvtx.range_pop()
         latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
