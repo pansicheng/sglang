@@ -8,6 +8,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -63,6 +64,43 @@ if is_flashinfer_available():
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+
+
+# Natural log of 2, used to convert FlashInfer's log2-based LSE to natural log.
+_LN2 = math.log(2.0)
+
+
+def _apply_sinks_correction(
+    output: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
+) -> torch.Tensor:
+    """Apply attention sinks correction to a softmax output that was computed
+    without the sink term.
+
+    With per-head sinks, the attention output equals
+        output_with_sink = output_normal * exp(lse_ln) / (exp(lse_ln) + exp(sink))
+                         = output_normal * sigmoid(lse_ln - sink)
+    where ``lse_ln`` is the natural-log (base-e) log-sum-exp of attention
+    logits and ``sink`` is the per-head learned scalar. Used to support
+    ``sinks`` on FlashInfer code paths that do not natively accept the
+    parameter (e.g. the ragged prefill wrapper and merged ragged+paged
+    outputs).
+
+    Note on LSE base:
+        This helper expects ``lse`` in log-base-2 as returned by FlashInfer's
+        ``forward_return_lse()`` (i.e. ``log2(sum(exp(scores)))``). The sinks
+        values are on a natural-log scale (matching Triton's native kernel
+        which uses ``exp``/``log`` in base-e), so ``lse`` is converted to
+        natural log internally before the sigmoid.
+
+    Args:
+        output: [num_tokens, num_heads, head_dim] attention output without sinks.
+        lse: [num_tokens, num_heads] log2-based log-sum-exp from the FlashInfer
+            attention kernel.
+        sinks: [num_heads] per-head sink scalars (natural-log scale).
+    """
+    lse_ln = lse.float() * _LN2
+    correction = torch.sigmoid(lse_ln - sinks.float().unsqueeze(0))
+    return (output.float() * correction.unsqueeze(-1)).to(output.dtype)
 
 
 @dataclass
@@ -805,6 +843,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks: Optional[torch.Tensor] = None,
     ):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
@@ -830,30 +869,50 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+            # Disable sliding window attention for multi-item scoring:
+            # - Sliding window could cut across item boundaries, breaking semantic coherence
+            # - Multi-item sequences need full attention to properly handle delimiter tokens
+            # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+            #   provide more precise attention control than simple sliding windows
+            # - Item-aware masking takes precedence over window-based masking
+            window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
             )
+            q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            if sinks is None:
+                o = prefill_wrapper_paged.forward(
+                    q_view,
+                    kv_buffer,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                # FlashInfer's fa2 paged_run silently drops the `sinks` argument
+                # (only the trtllm-gen backend forwards it to the kernel). Apply
+                # an LSE-based sink correction post-hoc instead: request lse from
+                # the kernel, then multiply the output by sigmoid(lse - sink).
+                o, lse = prefill_wrapper_paged.forward_return_lse(
+                    q_view,
+                    kv_buffer,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+                o = _apply_sinks_correction(o, lse, sinks)
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
@@ -871,18 +930,40 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            # Compute window_left for the ragged path — SWA layers must
+            # restrict attention to the last `sliding_window_size` tokens even
+            # during ragged prefill (matching the Triton kernel behaviour).
+            window_left = layer.sliding_window_size
+
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                if sinks is None:
+                    o = self.prefill_wrapper_ragged.forward(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        window_left=window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                else:
+                    # Ragged wrapper does not natively support `sinks`. Apply a post-hoc
+                    # correction using the LSE: with sinks, attention output equals
+                    # output_normal * exp(lse) / (exp(lse) + exp(sink))
+                    #                = output_normal * sigmoid(lse - sink)
+                    o, lse = self.prefill_wrapper_ragged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        window_left=window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                    o = _apply_sinks_correction(o, lse, sinks)
 
             else:
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -891,6 +972,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
+                    window_left=window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -898,10 +980,16 @@ class FlashInferAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
+                    window_left=window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
 
-                o, _ = merge_state(o1, s1, o2, s2)
+                if sinks is None:
+                    o, _ = merge_state(o1, s1, o2, s2)
+                else:
+                    # Apply sink correction to the merged output using the merged LSE.
+                    o, merged_lse = merge_state(o1, s1, o2, s2)
+                    o = _apply_sinks_correction(o, merged_lse, sinks)
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -919,6 +1007,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks: Optional[torch.Tensor] = None,
     ):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
@@ -936,16 +1025,34 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        if sinks is None:
+            # Call the wrapped function
+            o = decode_wrapper.forward(
+                q_view,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        else:
+            # FlashInfer's fa2 paged_run silently drops the `sinks` argument
+            # (only the trtllm-gen backend forwards it to the kernel). Apply
+            # an LSE-based sink correction post-hoc instead: request lse from
+            # the kernel, then multiply the output by sigmoid(lse - sink).
+            o, lse = decode_wrapper.forward_return_lse(
+                q_view,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            o = _apply_sinks_correction(o, lse, sinks)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1385,19 +1492,30 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
-            if wrapper_id == 0:
-                # window attention use paged only
-                paged_kernel_lens = torch.minimum(
-                    seq_lens,
-                    torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
-                )
+            if use_ragged:
+                if wrapper_id == 0:
+                    # window attention: paged covers last sliding_window_size of prefix
+                    paged_kernel_lens = torch.clamp(
+                        prefix_lens, max=self.sliding_window_size
+                    )
+                else:
+                    # full attention: paged covers all prefix tokens
+                    paged_kernel_lens = prefix_lens
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                kv_start_idx = prefix_lens - paged_kernel_lens
             else:
-                # full attention
-                paged_kernel_lens = seq_lens
-                paged_kernel_lens_sum = seq_lens_sum
-
-            kv_start_idx = seq_lens - paged_kernel_lens
+                if wrapper_id == 0:
+                    # window attention use paged only
+                    paged_kernel_lens = torch.minimum(
+                        seq_lens,
+                        torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
+                    )
+                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                else:
+                    # full attention
+                    paged_kernel_lens = seq_lens
+                    paged_kernel_lens_sum = seq_lens_sum
+                kv_start_idx = seq_lens - paged_kernel_lens
             use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
                 self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
             )
