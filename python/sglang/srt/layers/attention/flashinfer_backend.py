@@ -16,6 +16,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
@@ -70,6 +72,29 @@ class WrapperDispatch(Enum):
 _LN2 = math.log(2.0)
 
 
+@triton.jit
+def _fused_sinks_correction_kernel(
+    output_ptr,  # [N, H, D]
+    lse_ptr,  # [N, H], log2-base
+    sinks_ptr,  # [H], natural-log
+    stride_n,
+    stride_h,
+    H,
+    LN2: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    n = tl.program_id(0)
+    h = tl.program_id(1)
+    lse_val = tl.load(lse_ptr + n * H + h).to(tl.float32) * LN2
+    sink_val = tl.load(sinks_ptr + h).to(tl.float32)
+    correction = tl.sigmoid(lse_val - sink_val)
+
+    offs = tl.arange(0, BLOCK_D)
+    base = output_ptr + n * stride_n + h * stride_h
+    out = tl.load(base + offs).to(tl.float32) * correction
+    tl.store(base + offs, out.to(output_ptr.dtype.element_ty))
+
+
 def _apply_sinks_correction(
     output: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
 ) -> torch.Tensor:
@@ -82,25 +107,56 @@ def _apply_sinks_correction(
     where ``lse_ln`` is the natural-log (base-e) log-sum-exp of attention
     logits and ``sink`` is the per-head learned scalar. Used to support
     ``sinks`` on FlashInfer code paths that do not natively accept the
-    parameter (e.g. the ragged prefill wrapper and merged ragged+paged
-    outputs).
+    parameter (e.g. the ragged prefill wrapper, merged ragged+paged outputs
+    and the fa2 paged decode/prefill which silently drops ``sinks``).
 
     Note on LSE base:
-        This helper expects ``lse`` in log-base-2 as returned by FlashInfer's
-        ``forward_return_lse()`` (i.e. ``log2(sum(exp(scores)))``). The sinks
+        ``lse`` is in log-base-2 as returned by FlashInfer's
+        ``forward_return_lse()`` (i.e. ``log2(sum(exp(scores)))``). Sinks
         values are on a natural-log scale (matching Triton's native kernel
         which uses ``exp``/``log`` in base-e), so ``lse`` is converted to
         natural log internally before the sigmoid.
 
+    Implementation:
+        On CUDA tensors with a power-of-two ``head_dim``, the work is fused
+        into a single Triton kernel launch (sigmoid + in-place multiply).
+        The torch fallback path issues ~7 separate kernel launches per
+        invocation, and on gpt-oss-20b (24 layers × ~32k decode steps) that
+        overhead dominated the FlashInfer-vs-Triton throughput gap.
+
     Args:
-        output: [num_tokens, num_heads, head_dim] attention output without sinks.
-        lse: [num_tokens, num_heads] log2-based log-sum-exp from the FlashInfer
-            attention kernel.
+        output: [num_tokens, num_heads, head_dim] attention output without
+            sinks. Mutated in place; ``output`` is the freshly-allocated
+            FlashInfer wrapper result (or merge_state result) and is not
+            aliased by the caller, so this is safe.
+        lse: [num_tokens, num_heads] log2-based log-sum-exp from the
+            FlashInfer attention kernel.
         sinks: [num_heads] per-head sink scalars (natural-log scale).
     """
-    lse_ln = lse.float() * _LN2
-    correction = torch.sigmoid(lse_ln - sinks.float().unsqueeze(0))
-    return (output.float() * correction.unsqueeze(-1)).to(output.dtype)
+    if output.is_cuda and output.is_contiguous():
+        n, h, d = output.shape
+        # head_dim is small (≤ 256 for current models) and a power of two for
+        # all FlashInfer-supported configs; load it as a single Triton block.
+        if d > 0 and (d & (d - 1)) == 0:
+            _fused_sinks_correction_kernel[(n, h)](
+                output,
+                lse,
+                sinks,
+                output.stride(0),
+                output.stride(1),
+                h,
+                LN2=_LN2,
+                BLOCK_D=d,
+                num_warps=1,
+            )
+            return output
+
+    # Eager fallback (CPU / non-power-of-two head_dim): match the kernel math.
+    correction = torch.sigmoid(lse.float() * _LN2 - sinks.float().unsqueeze(0)).to(
+        output.dtype
+    )
+    output.mul_(correction.unsqueeze(-1))
+    return output
 
 
 @dataclass
