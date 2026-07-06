@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.layers.attention.flashinfer_backend import _LN2, _apply_sinks_correction
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
@@ -339,6 +340,18 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                         hidden_size=self.HIDDEN_SIZE,
                         loc_layout=layout,
                     )
+
+    def test_attention_sinks_correction(self):
+        torch.manual_seed(2026)
+        output = torch.randn(7, 4, self.HEAD_DIM, dtype=torch.float16, device="cuda")
+        lse_log2 = torch.randn(7, 4, dtype=torch.float32, device="cuda")
+        sinks = torch.randn(4, dtype=torch.float32, device="cuda")
+
+        expected = output * torch.sigmoid(
+            lse_log2 * _LN2 - sinks.unsqueeze(0)
+        ).unsqueeze(-1).to(output.dtype)
+        actual = _apply_sinks_correction(output.clone(), lse_log2, sinks)
+        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:

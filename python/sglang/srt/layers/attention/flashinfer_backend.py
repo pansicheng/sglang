@@ -10,6 +10,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -17,6 +18,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
@@ -122,6 +125,63 @@ if is_flashinfer_available():
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+
+
+_LN2 = math.log(2.0)
+
+
+@triton.jit
+def _fused_sinks_correction_kernel(
+    output_ptr,  # [N, H, D]
+    lse_ptr,  # [N, H], log2-base
+    sinks_ptr,  # [H], natural-log
+    stride_n,
+    stride_h,
+    H,
+    LN2: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    n = tl.program_id(0)
+    h = tl.program_id(1)
+    lse_val = tl.load(lse_ptr + n * H + h).to(tl.float32) * LN2
+    sink_val = tl.load(sinks_ptr + h).to(tl.float32)
+    correction = tl.sigmoid(lse_val - sink_val)
+
+    offs = tl.arange(0, BLOCK_D)
+    base = output_ptr + n * stride_n + h * stride_h
+    out = tl.load(base + offs).to(tl.float32) * correction
+    tl.store(base + offs, out.to(output_ptr.dtype.element_ty))
+
+
+def _apply_sinks_correction(
+    output: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
+) -> torch.Tensor:
+    """Apply GPT-OSS attention sinks to FlashInfer output.
+
+    FlashInfer's paged/ragged wrappers return output as if the sink term was
+    absent. The corrected result is output * sigmoid(lse_ln - sink).
+    """
+    if output.is_cuda and output.is_contiguous():
+        n, h, d = output.shape
+        if d > 0 and (d & (d - 1)) == 0:
+            _fused_sinks_correction_kernel[(n, h)](
+                output,
+                lse,
+                sinks,
+                output.stride(0),
+                output.stride(1),
+                h,
+                LN2=_LN2,
+                BLOCK_D=d,
+                num_warps=1,
+            )
+            return output
+
+    correction = torch.sigmoid(lse.float() * _LN2 - sinks.float().unsqueeze(0)).to(
+        output.dtype
+    )
+    output.mul_(correction.unsqueeze(-1))
+    return output
 
 
 @dataclass
@@ -1014,6 +1074,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks: Optional[torch.Tensor] = None,
     ):
         wrapper_idx = self._get_wrapper_idx(layer)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
@@ -1056,17 +1117,30 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 else -1
             )
-            o = prefill_wrapper_paged.forward(
-                q_view,
-                kv_buffer,
-                causal=causal,
-                sm_scale=layer.scaling,
-                window_left=window_left,
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+            if sinks is None:
+                o = prefill_wrapper_paged.forward(
+                    q_view,
+                    kv_buffer,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                o, lse = prefill_wrapper_paged.forward_return_lse(
+                    q_view,
+                    kv_buffer,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+                o = _apply_sinks_correction(o, lse, sinks)
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -1096,15 +1170,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    window_left=swa_window_left,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                if sinks is None:
+                    o = prefill_wrapper_ragged.forward(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                else:
+                    o, lse = prefill_wrapper_ragged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                    o = _apply_sinks_correction(o, lse, sinks)
 
             else:
                 o1, s1 = prefill_wrapper_ragged.forward_return_lse(
@@ -1127,7 +1213,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
 
-                o, _ = _safe_merge_state(o1, s1, o2, s2)
+                o, merged_lse = _safe_merge_state(o1, s1, o2, s2)
+                if sinks is not None:
+                    o = _apply_sinks_correction(o, merged_lse, sinks)
 
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
@@ -1150,6 +1238,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks: Optional[torch.Tensor] = None,
     ):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
@@ -1182,16 +1271,28 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_buffer = self._get_kv_buffer_for_flashinfer(
             layer.layer_id, self.forward_metadata.use_paged_kv_buffer
         )
-        o = decode_wrapper.forward(
-            q_view,
-            kv_buffer,
-            sm_scale=layer.scaling,
-            window_left=window_left,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        if sinks is None:
+            o = decode_wrapper.forward(
+                q_view,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                window_left=window_left,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        else:
+            o, lse = decode_wrapper.forward_return_lse(
+                q_view,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                window_left=window_left,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            o = _apply_sinks_correction(o, lse, sinks)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

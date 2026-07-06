@@ -4044,6 +4044,7 @@ class ServerArgs:
                 "trtllm_mha",
                 "fa3",
                 "fa4",
+                "flashinfer",
                 "ascend",
                 "intel_amx",
                 "intel_xpu",
