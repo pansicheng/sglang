@@ -41,9 +41,23 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     HEAD_DIM = 64
     HIDDEN_SIZE = 256
 
-    CASES = make_swa_no_prefix_input_config_cases(
-        "flashinfer"
-    ) + make_swa_prefix_input_config_cases("flashinfer")
+    CASES = (
+        make_swa_no_prefix_input_config_cases("flashinfer")
+        + (
+            DenseAttentionCase(
+                name="swa_extend_no_prefix_above_window",
+                backend="flashinfer",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(0,),
+                extend_lens=(9,),
+                sliding_window_size=4,
+            ),
+        )
+        + make_swa_prefix_input_config_cases("flashinfer")
+    )
     # Above-window decode case requires the `extend_window` reference rule
     # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
     # decode metadata uses `clamp(seq_lens, max=window+1)` per

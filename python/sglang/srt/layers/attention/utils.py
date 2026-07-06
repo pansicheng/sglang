@@ -1471,3 +1471,101 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
+
+
+@triton.jit
+def build_paged_kv_metadata_triton(
+    paged_kernel_lens_ptr,  # [bs] per-seq live KV token count
+    kv_indptr_ptr,  # [>= bs+1] output: cumulative num_pages
+    kv_last_page_len_ptr,  # [>= bs] output: last page fill (1..page_size)
+    bs,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < bs
+    lens = tl.load(paged_kernel_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    num_pages = (lens + PAGE_SIZE - 1) // PAGE_SIZE
+    last_len = lens - (num_pages - 1) * PAGE_SIZE
+    last_len = tl.where(num_pages > 0, last_len, 1)
+    cum = tl.cumsum(num_pages, axis=0)
+    tl.store(kv_indptr_ptr + offs + 1, cum, mask=mask)
+    tl.store(kv_indptr_ptr + offs, 0, mask=(offs == 0))
+    tl.store(kv_last_page_len_ptr + offs, last_len, mask=mask)
+
+
+@triton.jit
+def build_paged_prefill_metadata_triton(
+    paged_kernel_lens_ptr,  # [bs]
+    seq_lens_ptr,  # [bs]
+    prefix_lens_ptr,  # [bs]
+    kv_indptr_ptr,  # [>= bs+1] output
+    kv_last_page_len_ptr,  # [>= bs] output
+    qo_indptr_ptr,  # [>= bs+1] output: cumsum(seq_lens - prefix_lens)
+    bs,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < bs
+    lens = tl.load(paged_kernel_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    num_pages = (lens + PAGE_SIZE - 1) // PAGE_SIZE
+    last_len = lens - (num_pages - 1) * PAGE_SIZE
+    last_len = tl.where(num_pages > 0, last_len, 1)
+    cum_kv = tl.cumsum(num_pages, axis=0)
+    tl.store(kv_indptr_ptr + offs + 1, cum_kv, mask=mask)
+    tl.store(kv_indptr_ptr + offs, 0, mask=(offs == 0))
+    tl.store(kv_last_page_len_ptr + offs, last_len, mask=mask)
+
+    sl = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    pl = tl.load(prefix_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    cum_qo = tl.cumsum(sl - pl, axis=0)
+    tl.store(qo_indptr_ptr + offs + 1, cum_qo, mask=mask)
+    tl.store(qo_indptr_ptr + offs, 0, mask=(offs == 0))
+
+
+@triton.jit
+def fill_paged_kv_indices_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,  # [bs]
+    kv_start_idx_ptr,  # [bs] or nullable
+    kv_indptr_ptr,  # [bs+1] page-level cumulative
+    kv_indices_ptr,  # [total_pages] output page ids
+    full_to_swa_index_mapping_ptr,  # [full slots] optional full->SWA slot LUT
+    req_to_token_ptr_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_SWA: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    out_start = tl.load(kv_indptr_ptr + pid).to(tl.int64)
+    out_end = tl.load(kv_indptr_ptr + pid + 1).to(tl.int64)
+    num_pages = out_end - out_start
+
+    kv_start = tl.zeros([], dtype=tl.int64)
+    if kv_start_idx_ptr:
+        kv_start = tl.load(kv_start_idx_ptr + pid).to(tl.int64)
+
+    num_loop = tl.cdiv(num_pages, BLOCK)
+    for i in range(num_loop):
+        offs = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+        mask = offs < num_pages
+        token_id = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offs * PAGE_SIZE,
+            mask=mask,
+        )
+        if USE_SWA:
+            token_id = tl.load(
+                full_to_swa_index_mapping_ptr + token_id.to(tl.int64),
+                mask=mask,
+                other=0,
+            )
+        tl.store(
+            kv_indices_ptr + out_start + offs,
+            token_id // PAGE_SIZE,
+            mask=mask,
+        )

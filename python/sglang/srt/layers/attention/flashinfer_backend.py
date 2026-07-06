@@ -24,7 +24,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
+    build_paged_kv_metadata_triton,
+    build_paged_prefill_metadata_triton,
     create_flashinfer_kv_indices_triton,
+    fill_paged_kv_indices_triton,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -156,6 +159,7 @@ class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    use_paged_kv_buffer: bool = True
 
 
 @dataclass
@@ -165,6 +169,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    use_paged_kv_buffer: bool = True
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -397,6 +402,12 @@ class FlashInferAttnBackend(AttentionBackend):
         max_bs = _cuda_graph_capture_max_bs(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
+
+        self.kv_page_size = model_runner.page_size
+        self.paged = self.kv_page_size > 1
+        if self.paged:
+            self.paged_scan_block = next_power_of_2(max_bs + 1)
+
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -409,12 +420,13 @@ class FlashInferAttnBackend(AttentionBackend):
             self.kv_indptr = [kv_indptr_buf]
 
         if kv_last_page_len_buf is None:
-            self.kv_last_page_len = torch.ones(
-                (max_bs,), dtype=torch.int32, device=model_runner.device
-            )
+            self.kv_last_page_len = [
+                torch.ones((max_bs,), dtype=torch.int32, device=model_runner.device)
+                for _ in range(self.num_wrappers)
+            ]
         else:
             assert self.num_wrappers == 1
-            self.kv_last_page_len = kv_last_page_len_buf
+            self.kv_last_page_len = [kv_last_page_len_buf]
 
         if not self.skip_prefill:
             self.qo_indptr = [
@@ -430,9 +442,13 @@ class FlashInferAttnBackend(AttentionBackend):
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
+        self.prefill_wrappers_ragged = [
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=fmha_backend
+            )
+            for _ in range(self.num_wrappers)
+        ]
+        self.prefill_wrapper_ragged = self.prefill_wrappers_ragged[0]
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -713,6 +729,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
             and self.dispatch_reason is None
+            and not self.paged
         ):
             # Like decode: swap in fast_prefill_plan for replay, after the real
             # plan() above set up _cached_module (host metadata supplied per-replay
@@ -757,7 +774,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(
-                self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+                self.decode_wrappers,
+                swa_out_cache_loc=swa_out_cache_loc,
+                use_paged_kv_buffer=forward_batch.spec_info is None,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -776,6 +795,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 False,
                 False,
                 swa_out_cache_loc=swa_out_cache_loc,
+                use_paged_kv_buffer=False,
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -825,6 +845,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                use_paged_kv_buffer=True,
             )
 
     def init_cuda_graph_state(
@@ -879,7 +900,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_tensor_cores=self.decode_use_tensor_cores,
                 paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
                 paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+                paged_kv_last_page_len_buffer=self.kv_last_page_len[i][:num_tokens],
             )
             for i in range(self.num_wrappers)
         ]
@@ -909,7 +930,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                     paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                     paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    paged_kv_last_page_len_buf=self.kv_last_page_len[i][:bs],
                     **extra,
                 )
             )
@@ -925,7 +946,9 @@ class FlashInferAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                decode_wrappers, use_paged_kv_buffer=spec_info is None
+            )
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
                 forward_mode.is_target_verify()
@@ -935,18 +958,52 @@ class FlashInferAttnBackend(AttentionBackend):
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
-                prefill_wrappers, forward_mode.is_dllm_extend(), False
+                prefill_wrappers,
+                forward_mode.is_dllm_extend(),
+                False,
+                use_paged_kv_buffer=forward_mode.is_dllm_extend(),
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
             self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            self.forward_metadata = PrefillMetadata(
+                prefill_wrappers, False, False, use_paged_kv_buffer=False
+            )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    def _get_kv_buffer_for_flashinfer(
+        self, layer_id: int, use_paged_kv_buffer: bool = True
+    ):
+        kv_buffer = self.token_to_kv_pool.get_kv_buffer(layer_id)
+        if not self.paged or not use_paged_kv_buffer:
+            return kv_buffer
+
+        k_buffer, v_buffer = kv_buffer
+        if k_buffer.ndim == 4:
+            return kv_buffer
+        if k_buffer.ndim != 3 or v_buffer.ndim != 3:
+            raise ValueError(
+                "FlashInfer paged attention expects per-layer KV buffers to be "
+                f"3D token-major or 4D page-major, got {k_buffer.ndim=} "
+                f"{v_buffer.ndim=}."
+            )
+
+        page_size = self.kv_page_size
+        if k_buffer.shape[0] % page_size != 0 or v_buffer.shape[0] % page_size != 0:
+            raise ValueError(
+                "FlashInfer paged attention needs KV slot count divisible by "
+                f"page_size, got k_slots={k_buffer.shape[0]}, "
+                f"v_slots={v_buffer.shape[0]}, {page_size=}."
+            )
+        return (
+            k_buffer.view(-1, page_size, k_buffer.shape[1], k_buffer.shape[2]),
+            v_buffer.view(-1, page_size, v_buffer.shape[1], v_buffer.shape[2]),
+        )
 
     @debug_kernel_api
     def forward_extend(
@@ -958,9 +1015,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        wrapper_idx = self._get_wrapper_idx(layer)
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
+        prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -987,25 +1044,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            kv_buffer = self._get_kv_buffer_for_flashinfer(
+                layer.layer_id, self.forward_metadata.use_paged_kv_buffer
+            )
+            window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
+            )
             o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                q_view,
+                kv_buffer,
                 causal=causal,
                 sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
+                window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
@@ -1028,29 +1084,30 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            swa_window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
+            )
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
+                    window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
 
             else:
-                swa_window_left = (
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1061,10 +1118,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    self._get_kv_buffer_for_flashinfer(
+                        layer.layer_id, self.forward_metadata.use_paged_kv_buffer
+                    ),
                     causal=False,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=-1 if self.paged else swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
 
@@ -1114,10 +1173,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Call the wrapped function
+        window_left = (
+            layer.sliding_window_size
+            if layer.sliding_window_size is not None and layer.sliding_window_size > 0
+            else -1
+        )
+        q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        kv_buffer = self._get_kv_buffer_for_flashinfer(
+            layer.layer_id, self.forward_metadata.use_paged_kv_buffer
+        )
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            q_view,
+            kv_buffer,
             sm_scale=layer.scaling,
+            window_left=window_left,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
@@ -1152,6 +1221,10 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.paged = attn_backend.paged
+        self.kv_page_size = attn_backend.kv_page_size
+        if self.paged:
+            self.paged_scan_block = attn_backend.paged_scan_block
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1202,6 +1275,7 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens,
             seq_lens_sum,
             self.kv_indptr[0],
+            self.kv_last_page_len[0],
             None,
             spec_info,
             seq_lens_cpu,
@@ -1223,19 +1297,36 @@ class FlashInferIndicesUpdaterDecode:
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
-            if wrapper_id == 0:
+            use_sliding_window_kv_pool = (
+                wrapper_id == 0 and self._swa_kv_pool is not None
+            )
+            is_sliding_window_wrapper = wrapper_id == 0
+            if is_sliding_window_wrapper:
                 # Sliding window attention
                 paged_kernel_lens_tmp = torch.clamp(
                     seq_lens, max=self.sliding_window_size + 1
                 )
+                kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
                 if seq_lens_cpu is not None:
                     seq_lens_cpu_tmp = torch.clamp(
                         seq_lens_cpu, max=self.sliding_window_size + 1
                     )
+                    if self.paged:
+                        kv_start_idx_cpu_tmp = seq_lens_cpu - seq_lens_cpu_tmp
+                        kv_start_idx_cpu_tmp = (
+                            kv_start_idx_cpu_tmp // self.kv_page_size
+                        ) * self.kv_page_size
+                        seq_lens_cpu_tmp = seq_lens_cpu - kv_start_idx_cpu_tmp
                     paged_kernel_lens_sum_tmp = seq_lens_cpu_tmp.sum().item()
                 else:
                     paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
-                kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
+                if self.paged:
+                    kv_start_idx_tmp = (
+                        kv_start_idx_tmp // self.kv_page_size
+                    ) * self.kv_page_size
+                    paged_kernel_lens_tmp = seq_lens - kv_start_idx_tmp
+                    if seq_lens_cpu is None:
+                        paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
             else:
                 # Full attention
                 paged_kernel_lens_tmp = seq_lens
@@ -1243,22 +1334,22 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu_tmp = seq_lens_cpu
                 kv_start_idx_tmp = None
 
-            use_sliding_window_kv_pool = (
-                wrapper_id == 0 and self._swa_kv_pool is not None
-            )
-
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
+                self.kv_last_page_len[wrapper_id],
                 kv_start_idx_tmp,
                 spec_info,
                 seq_lens_cpu=seq_lens_cpu_tmp,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                window_left=(
+                    self.sliding_window_size if is_sliding_window_wrapper else -1
+                ),
             )
 
     def update_cross_attention(
@@ -1293,6 +1384,7 @@ class FlashInferIndicesUpdaterDecode:
                 paged_kernel_lens,
                 seq_lens_sum,
                 self.kv_indptr[wrapper_id],
+                self.kv_last_page_len[wrapper_id],
                 kv_start_idx,
                 spec_info,
                 seq_lens_cpu=kv_lens_cpu,
@@ -1307,14 +1399,55 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        window_left: int = -1,
     ):
-        if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
+        use_paged_kv = self.paged and spec_info is None
+        effective_page_size = self.kv_page_size if use_paged_kv else 1
+        plan_window_left = window_left if use_paged_kv else -1
+        if use_paged_kv:
+            bs = len(req_pool_indices)
+            build_paged_kv_metadata_triton[(1,)](
+                paged_kernel_lens,
+                kv_indptr,
+                kv_last_page_len,
+                bs,
+                PAGE_SIZE=effective_page_size,
+                BLOCK=self.paged_scan_block,
+            )
+            kv_indptr = kv_indptr[: bs + 1]
+            if wrapper.is_cuda_graph_enabled:
+                kv_indices = wrapper._paged_kv_indices_buf
+            else:
+                total_pages_ub = paged_kernel_lens_sum // effective_page_size + bs + 1
+                kv_indices = torch.empty(
+                    total_pages_ub, dtype=torch.int32, device="cuda"
+                )
+
+            full_to_swa_index_mapping = (
+                self._swa_kv_pool.full_to_swa_index_mapping
+                if use_sliding_window_kv_pool
+                else self.req_to_token
+            )
+            fill_paged_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_start_idx,
+                kv_indptr,
+                kv_indices,
+                full_to_swa_index_mapping,
+                self.req_to_token.shape[1],
+                PAGE_SIZE=effective_page_size,
+                BLOCK=256,
+                USE_SWA=use_sliding_window_kv_pool,
+            )
+        elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -1340,7 +1473,10 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
-        if use_sliding_window_kv_pool:
+        if not use_paged_kv:
+            kv_last_page_len[:bs].fill_(1)
+
+        if use_sliding_window_kv_pool and not use_paged_kv:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
@@ -1355,7 +1491,17 @@ class FlashInferIndicesUpdaterDecode:
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
-            global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
+            if use_paged_kv:
+                page_lens_cpu = (
+                    seq_lens_cpu.to(torch.int32) + effective_page_size - 1
+                ) // effective_page_size
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    page_lens_cpu, dim=0
+                )
+            else:
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    seq_lens_cpu, dim=0
+                )
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
@@ -1369,11 +1515,12 @@ class FlashInferIndicesUpdaterDecode:
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
-                self.kv_last_page_len[:bs],
+                kv_last_page_len[:bs],
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                effective_page_size,
+                window_left=plan_window_left,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1388,11 +1535,12 @@ class FlashInferIndicesUpdaterDecode:
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
-                self.kv_last_page_len[:bs],
+                kv_last_page_len[:bs],
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                effective_page_size,
+                window_left=plan_window_left,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1420,13 +1568,17 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.paged = attn_backend.paged
+        self.kv_page_size = attn_backend.kv_page_size
+        if self.paged:
+            self.paged_scan_block = attn_backend.paged_scan_block
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1485,7 +1637,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            self.prefill_wrappers_ragged[0],
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -1494,6 +1646,7 @@ class FlashInferIndicesUpdaterPrefill:
             prefix_lens,
             None,
             self.kv_indptr[0],
+            self.kv_last_page_len[0],
             self.qo_indptr[0],
             use_ragged,
             spec_info,
@@ -1532,19 +1685,24 @@ class FlashInferIndicesUpdaterPrefill:
         assert sliding_window_size is not None
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
-            if wrapper_id == 0:
+            use_sliding_window_kv_pool = (
+                wrapper_id == 0 and self._swa_kv_pool is not None
+            )
+            is_sliding_window_wrapper = wrapper_id == 0
+            if is_sliding_window_wrapper:
                 if use_ragged:
                     # K for extend tokens is written after the paged wrapper runs, so
                     # the paged wrapper sees prefix-only. Trim to the last `window` tokens
                     # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
-                    effective_start = torch.clamp(
-                        prefix_lens - sliding_window_size, min=0
-                    )
-                    paged_kernel_lens = prefix_lens - effective_start
+                    kv_start_idx = torch.clamp(prefix_lens - sliding_window_size, min=0)
+                    if self.paged:
+                        kv_start_idx = (
+                            kv_start_idx // self.kv_page_size
+                        ) * self.kv_page_size
+                    paged_kernel_lens = prefix_lens - kv_start_idx
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-                    kv_start_idx = effective_start
                     swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
-                        prefix_lens, seq_lens, effective_start
+                        prefix_lens, seq_lens, kv_start_idx
                     )
                 else:
                     # window attention use paged only
@@ -1552,19 +1710,21 @@ class FlashInferIndicesUpdaterPrefill:
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
                     )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+                    if self.paged:
+                        kv_start_idx = (
+                            kv_start_idx // self.kv_page_size
+                        ) * self.kv_page_size
+                        paged_kernel_lens = seq_lens - kv_start_idx
+                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
                 kv_start_idx = seq_lens - paged_kernel_lens
-            use_sliding_window_kv_pool = (
-                wrapper_id == 0 and self._swa_kv_pool is not None
-            )
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -1573,6 +1733,7 @@ class FlashInferIndicesUpdaterPrefill:
                 prefix_lens,
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
+                self.kv_last_page_len[wrapper_id],
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
@@ -1580,6 +1741,14 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                ragged_window_left=(
+                    sliding_window_size if is_sliding_window_wrapper else -1
+                ),
+                window_left=(
+                    sliding_window_size
+                    if is_sliding_window_wrapper and not (self.paged and use_ragged)
+                    else -1
+                ),
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1652,7 +1821,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -1661,6 +1830,7 @@ class FlashInferIndicesUpdaterPrefill:
                 prefix_lens,
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
+                self.kv_last_page_len[wrapper_id],
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
@@ -1682,6 +1852,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: Optional[torch.Tensor],
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[SpecInput],
@@ -1690,9 +1861,54 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        ragged_window_left: int = -1,
+        window_left: int = -1,
     ):
         bs = len(seq_lens)
-        if spec_info is None:
+        use_paged_kv = self.paged and spec_info is None
+        effective_page_size = self.kv_page_size if use_paged_kv else 1
+        plan_window_left = window_left if use_paged_kv else -1
+        if use_paged_kv:
+            assert prefix_lens is not None
+            assert len(seq_lens) == len(req_pool_indices)
+            build_paged_prefill_metadata_triton[(1,)](
+                paged_kernel_lens,
+                seq_lens,
+                prefix_lens,
+                kv_indptr,
+                kv_last_page_len,
+                qo_indptr,
+                bs,
+                PAGE_SIZE=effective_page_size,
+                BLOCK=self.paged_scan_block,
+            )
+            kv_indptr = kv_indptr[: bs + 1]
+            qo_indptr = qo_indptr[: bs + 1]
+            total_pages_ub = paged_kernel_lens_sum // effective_page_size + bs + 1
+            kv_indices = torch.empty(
+                total_pages_ub,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+            full_to_swa_index_mapping = (
+                self._swa_kv_pool.full_to_swa_index_mapping
+                if use_sliding_window_kv_pool
+                else self.req_to_token
+            )
+            fill_paged_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_start_idx,
+                kv_indptr,
+                kv_indices,
+                full_to_swa_index_mapping,
+                self.req_to_token.shape[1],
+                PAGE_SIZE=effective_page_size,
+                BLOCK=256,
+                USE_SWA=use_sliding_window_kv_pool,
+            )
+            custom_mask = cross_attention_custom_mask
+        elif spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
@@ -1739,6 +1955,9 @@ class FlashInferIndicesUpdaterPrefill:
                 )
 
         # extend part
+        if not use_paged_kv:
+            kv_last_page_len[:bs].fill_(1)
+
         if use_ragged:
             wrapper_ragged.begin_forward(
                 qo_indptr,
@@ -1746,10 +1965,11 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                window_left=ragged_window_left,
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not use_paged_kv:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
@@ -1781,7 +2001,8 @@ class FlashInferIndicesUpdaterPrefill:
         paged_plan_kwargs = {}
         num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", None)
         uses_fast_prefill = (
-            hasattr(wrapper_paged.begin_forward, "func")
+            not self.paged
+            and hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:
@@ -1813,11 +2034,12 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            effective_page_size,
+            window_left=plan_window_left,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
